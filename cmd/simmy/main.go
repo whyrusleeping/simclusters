@@ -2,14 +2,17 @@ package main
 
 import (
 	"encoding/csv"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"strconv"
 	"sync"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/whyrusleeping/simclusters"
 )
 
@@ -19,36 +22,27 @@ func main() {
 	}
 }
 
-func runMain() error {
-	//fi, err := os.Open("/home/why/follows.csv")
-	fi, err := os.Open("follows2.csv")
+func loadEdgesFromFile(simc *simclusters.SimClusters, fn string) error {
+	fi, err := os.Open(fn)
 	if err != nil {
 		return err
 	}
 
-	go func() {
-		http.ListenAndServe(":9123", nil)
-	}()
-
-	recs, err := csv.NewReader(fi).ReadAll()
-	if err != nil {
-		return err
-	}
-
-	cfg := simclusters.DefaultConfig()
-	simc := simclusters.NewSimClusters(cfg)
+	rr := csv.NewReader(fi)
 
 	var edges []simclusters.Edge
-	for i, rec := range recs[1:] {
-		if i%500 == 0 {
-			fmt.Printf("%d / %d    \r", i, len(recs))
+	for i := 0; true; i++ {
+		rec, err := rr.Read()
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		from, err := strconv.Atoi(rec[4])
+
+		from, err := strconv.Atoi(rec[1])
 		if err != nil {
 			return err
 		}
 
-		to, err := strconv.Atoi(rec[5])
+		to, err := strconv.Atoi(rec[2])
 		if err != nil {
 			return err
 		}
@@ -59,30 +53,43 @@ func runMain() error {
 		})
 	}
 
+	simc.IngestEdges(edges)
+
+	return nil
+}
+
+func runMain() error {
+	//fi, err := os.Open("/home/why/follows.csv")
+	go func() {
+		http.ListenAndServe(":9123", nil)
+	}()
+
+	cfg := simclusters.DefaultConfig()
+	simc := simclusters.NewSimClusters(cfg)
+
+	files := os.Args[1:]
+
+	bar := progressbar.Default(int64(len(files)))
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		start := i * len(edges) / 10
-		end := (i + 1) * len(edges) / 10
-		slice := edges[start:end]
+	sema := make(chan struct{}, 30)
+	for _, fn := range files {
 		wg.Add(1)
-		go func(subset []simclusters.Edge) {
-			defer wg.Done()
-			simc.IngestEdges(subset)
-		}(slice)
+		sema <- struct{}{}
+		go func(file string) {
+			defer func() {
+				<-sema
+				wg.Done()
+				bar.Add(1)
+			}()
+
+			if err := loadEdgesFromFile(simc, file); err != nil {
+				slog.Error("failed to load edges", "file", file, "error", err)
+			}
+		}(fn)
 	}
 	wg.Wait()
 
 	if err := simc.ComputeClusters(); err != nil {
-		return err
-	}
-
-	outfi, err := os.Create("output.json")
-	if err != nil {
-		return err
-	}
-	defer outfi.Close()
-
-	if err := json.NewEncoder(outfi).Encode(simc.GetClusterIndex().Clusters); err != nil {
 		return err
 	}
 

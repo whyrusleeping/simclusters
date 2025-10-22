@@ -6,11 +6,13 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/schollz/progressbar/v3"
 )
 
 // SimClusters is the main structure for the SimClusters algorithm
@@ -20,6 +22,8 @@ type SimClusters struct {
 
 	// Indices
 	graphIndex *GraphIndex
+
+	MaxConcurrency int
 
 	// State tracking
 	needsFullRecompute bool
@@ -37,15 +41,8 @@ func NewSimClusters(config *Config) *SimClusters {
 		graphIndex:         NewGraphIndex(),
 		needsFullRecompute: true,
 		updateEpoch:        0,
+		MaxConcurrency:     runtime.NumCPU(),
 	}
-}
-
-// IngestEdge adds a single edge to the graph
-func (sc *SimClusters) IngestEdge(from, to int64) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	sc.graphIndex.AddEdge(from, to)
 }
 
 // IngestEdges adds multiple edges to the graph
@@ -121,7 +118,6 @@ func (sc *SimClusters) identifyInfluencers() []int64 {
 // Expects normA := math.Sqrt(float64(a.GetCardinality()))
 // to be passed in so we don't have to redo this operation over and over again
 func BitmapCosineSimilarity(normA float64, a, b *roaring64.Bitmap) float32 {
-	dotProduct := a.AndCardinality(b) // Intersection IS the dot product
 
 	//normA := math.Sqrt(float64(a.GetCardinality())) // sqrt of count
 	normB := math.Sqrt(float64(b.GetCardinality()))
@@ -129,6 +125,7 @@ func BitmapCosineSimilarity(normA float64, a, b *roaring64.Bitmap) float32 {
 	if normA == 0 || normB == 0 {
 		return 0
 	}
+	dotProduct := a.AndCardinality(b) // Intersection IS the dot product
 
 	return float32(dotProduct) / float32(normA*normB)
 }
@@ -144,12 +141,19 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	var ilk sync.Mutex
 	infMatrix := make(map[matKey]float32)
 
+	bar := progressbar.Default(int64(len(influencers)))
 	start := time.Now()
+	sema := make(chan struct{}, sc.MaxConcurrency)
 	var wg sync.WaitGroup
 	for i, uid := range influencers {
 		wg.Add(1)
+		sema <- struct{}{}
 		go func(ix int, uidx int64) {
 			defer wg.Done()
+			defer func() {
+				bar.Add(1)
+				<-sema
+			}()
 
 			folset := sc.graphIndex.GetFollowers(uidx)
 			normA := math.Sqrt(float64(folset.GetCardinality()))
@@ -174,6 +178,7 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	}
 
 	wg.Wait()
+	bar.Finish()
 
 	var minval float32 = 100000000
 	var maxval, sum float32
@@ -365,7 +370,7 @@ func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]int, numCommunities 
 	sema := make(chan struct{}, 100)
 
 	// For each consumer (user who follows others)
-	for consumer, producers := range gi.Following {
+	gi.Following.Range(func(consumer int64, producers *roaring64.Bitmap) bool {
 		wg.Add(1)
 		sema <- struct{}{}
 		go func(cons int64, folmap *roaring64.Bitmap) {
@@ -403,7 +408,8 @@ func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]int, numCommunities 
 				lk.Unlock()
 			}
 		}(consumer, producers)
-	}
+		return true
+	})
 
 	wg.Wait()
 

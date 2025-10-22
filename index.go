@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	smap "github.com/zolstein/sync-map"
 )
 
 // GraphIndex maintains efficient indices for the follow graph
@@ -11,12 +12,14 @@ type GraphIndex struct {
 	mu sync.RWMutex
 
 	// Forward index: follower -> list of users they follow
-	Following   map[int64]*roaring64.Bitmap
-	followingLk sync.Mutex
+	Following smap.Map[int64, *roaring64.Bitmap]
+	//Following    map[int64]*roaring64.Bitmap
+	followingLks []sync.Mutex
 
 	// Inverted index: followed (influencer) -> list of followers
-	Followers   map[int64]*roaring64.Bitmap
-	followersLk sync.Mutex
+	//Followers    map[int64]*roaring64.Bitmap
+	Followers    smap.Map[int64, *roaring64.Bitmap]
+	followersLks []sync.Mutex
 
 	// User metadata
 	Users map[int64]*User
@@ -28,11 +31,15 @@ type GraphIndex struct {
 	CanonicalMapping map[int64]int64
 }
 
+const numLocks = 20
+
 // NewGraphIndex creates a new graph index
 func NewGraphIndex() *GraphIndex {
 	return &GraphIndex{
-		Following:        make(map[int64]*roaring64.Bitmap),
-		Followers:        make(map[int64]*roaring64.Bitmap),
+		//Following:        make(map[int64]*roaring64.Bitmap),
+		//Followers:        make(map[int64]*roaring64.Bitmap),
+		followingLks:     make([]sync.Mutex, numLocks),
+		followersLks:     make([]sync.Mutex, numLocks),
 		Users:            make(map[int64]*User),
 		Influencers:      make(map[int64]bool),
 		CanonicalMapping: make(map[int64]int64),
@@ -40,22 +47,24 @@ func NewGraphIndex() *GraphIndex {
 }
 
 // AddEdge adds a follow edge to the index
+
+/*
 func (gi *GraphIndex) AddEdge(from, to int64) {
 	// Add to forward index
-	gi.followingLk.Lock()
+	gi.followingLks[from%numLocks].Lock()
 	if _, exists := gi.Following[from]; !exists {
 		gi.Following[from] = roaring64.New()
 	}
 	gi.Following[from].Add(uint64(to))
-	gi.followingLk.Unlock()
+	gi.followingLks[from%numLocks].Unlock()
 
 	// Add to inverted index
-	gi.followersLk.Lock()
+	gi.followersLks[to%numLocks].Lock()
 	if _, exists := gi.Followers[to]; !exists {
 		gi.Followers[to] = roaring64.New()
 	}
 	gi.Followers[to].Add(uint64(from))
-	gi.followersLk.Unlock()
+	gi.followersLks[to%numLocks].Unlock()
 
 	gi.mu.Lock()
 	defer gi.mu.Unlock()
@@ -65,7 +74,6 @@ func (gi *GraphIndex) AddEdge(from, to int64) {
 			ID:            from,
 			FollowerCount: 0,
 			IsInfluencer:  false,
-			CanonicalID:   0,
 		}
 	}
 
@@ -74,33 +82,58 @@ func (gi *GraphIndex) AddEdge(from, to int64) {
 			ID:            to,
 			FollowerCount: 1,
 			IsInfluencer:  false,
-			CanonicalID:   0,
 		}
 	} else {
 		touser.FollowerCount++
 	}
 }
+*/
 
-func (gi *GraphIndex) AddEdges(edges []Edge) {
+func (gi *GraphIndex) AddEdgesBatch(edges []Edge) {
+	following := make(map[int64]*roaring64.Bitmap)
+	followers := make(map[int64]*roaring64.Bitmap)
+
 	// Add to forward index
-	gi.followingLk.Lock()
 	for _, e := range edges {
-		if _, exists := gi.Following[e.From]; !exists {
-			gi.Following[e.From] = roaring64.New()
+		fmap, ok := following[e.From]
+		if !ok {
+			fmap = roaring64.New()
+			following[e.From] = fmap
 		}
-		gi.Following[e.From].Add(uint64(e.To))
+		fmap.Add(uint64(e.To))
 	}
-	gi.followingLk.Unlock()
 
 	// Add to inverted index
-	gi.followersLk.Lock()
 	for _, e := range edges {
-		if _, exists := gi.Followers[e.To]; !exists {
-			gi.Followers[e.To] = roaring64.New()
+		fmap, ok := followers[e.To]
+		if !ok {
+			fmap = roaring64.New()
+			followers[e.To] = fmap
 		}
-		gi.Followers[e.To].Add(uint64(e.From))
+		fmap.Add(uint64(e.From))
 	}
-	gi.followersLk.Unlock()
+
+	for k, v := range following {
+		fmap, ok := gi.Following.Load(k)
+		if !ok {
+			fmap = roaring64.New()
+			gi.Following.Store(k, fmap)
+		}
+		gi.followingLks[k%numLocks].Lock()
+		fmap.Or(v)
+		gi.followingLks[k%numLocks].Unlock()
+	}
+
+	for k, v := range followers {
+		fmap, ok := gi.Followers.Load(k)
+		if !ok {
+			fmap = roaring64.New()
+			gi.Followers.Store(k, fmap)
+		}
+		gi.followersLks[k%numLocks].Lock()
+		fmap.Or(v)
+		gi.followersLks[k%numLocks].Unlock()
+	}
 
 	gi.mu.Lock()
 	defer gi.mu.Unlock()
@@ -111,7 +144,6 @@ func (gi *GraphIndex) AddEdges(edges []Edge) {
 				ID:            e.From,
 				FollowerCount: 0,
 				IsInfluencer:  false,
-				CanonicalID:   0,
 			}
 		}
 
@@ -120,7 +152,55 @@ func (gi *GraphIndex) AddEdges(edges []Edge) {
 				ID:            e.To,
 				FollowerCount: 1,
 				IsInfluencer:  false,
-				CanonicalID:   0,
+			}
+		} else {
+			touser.FollowerCount++
+		}
+	}
+}
+
+func (gi *GraphIndex) AddEdges(edges []Edge) {
+	// Add to forward index
+	for _, e := range edges {
+		fmap, ok := gi.Following.Load(e.From)
+		if !ok {
+			fmap = roaring64.New()
+			gi.Following.Store(e.From, fmap)
+		}
+		gi.followingLks[e.From%numLocks].Lock()
+		fmap.Add(uint64(e.To))
+		gi.followingLks[e.From%numLocks].Unlock()
+	}
+
+	// Add to inverted index
+	for _, e := range edges {
+		fmap, ok := gi.Followers.Load(e.To)
+		if !ok {
+			fmap = roaring64.New()
+			gi.Followers.Store(e.To, fmap)
+		}
+		gi.followersLks[e.To%numLocks].Lock()
+		fmap.Add(uint64(e.From))
+		gi.followersLks[e.To%numLocks].Unlock()
+	}
+
+	gi.mu.Lock()
+	defer gi.mu.Unlock()
+	// Ensure users exist
+	for _, e := range edges {
+		if _, exists := gi.Users[e.From]; !exists {
+			gi.Users[e.From] = &User{
+				ID:            e.From,
+				FollowerCount: 0,
+				IsInfluencer:  false,
+			}
+		}
+
+		if touser, exists := gi.Users[e.To]; !exists {
+			gi.Users[e.To] = &User{
+				ID:            e.To,
+				FollowerCount: 1,
+				IsInfluencer:  false,
 			}
 		} else {
 			touser.FollowerCount++
@@ -133,7 +213,7 @@ func (gi *GraphIndex) GetFollowing(userID int64) *roaring64.Bitmap {
 	gi.mu.RLock()
 	defer gi.mu.RUnlock()
 
-	if following, exists := gi.Following[userID]; exists {
+	if following, exists := gi.Following.Load(userID); exists {
 		return following
 	}
 	return roaring64.New()
@@ -144,7 +224,7 @@ func (gi *GraphIndex) GetFollowers(userID int64) *roaring64.Bitmap {
 	gi.mu.RLock()
 	defer gi.mu.RUnlock()
 
-	if followers, exists := gi.Followers[userID]; exists {
+	if followers, exists := gi.Followers.Load(userID); exists {
 		return followers
 	}
 	return roaring64.New()
@@ -189,34 +269,12 @@ func (gi *GraphIndex) GetInfluencers() []int64 {
 	return result
 }
 
-// SetCanonicalMapping sets the canonical mapping for a deduplicated user
-func (gi *GraphIndex) SetCanonicalMapping(userID, canonicalID int64) {
-	gi.mu.Lock()
-	defer gi.mu.Unlock()
-
-	gi.CanonicalMapping[userID] = canonicalID
-	if user, exists := gi.Users[userID]; exists {
-		user.CanonicalID = canonicalID
-	}
-}
-
-// GetCanonicalID returns the canonical user ID for a given user
-func (gi *GraphIndex) GetCanonicalID(userID int64) int64 {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	if canonical, exists := gi.CanonicalMapping[userID]; exists {
-		return canonical
-	}
-	return userID // Self is canonical
-}
-
 // GetFollowingCount returns the number of users a given user follows
 func (gi *GraphIndex) GetFollowingCount(userID int64) int {
 	gi.mu.RLock()
 	defer gi.mu.RUnlock()
 
-	if following, exists := gi.Following[userID]; exists {
+	if following, exists := gi.Following.Load(userID); exists {
 		return int(following.GetCardinality())
 	}
 	return 0

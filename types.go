@@ -11,7 +11,6 @@ type User struct {
 	ID            int64
 	FollowerCount int32 // Number of followers (for influencer detection)
 	IsInfluencer  bool  // Whether this user is an influencer
-	CanonicalID   int64 // If deduplicated, points to canonical user ID (0 if self)
 }
 
 // Cluster represents a community/cluster of similar users
