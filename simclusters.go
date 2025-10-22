@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
@@ -20,14 +21,9 @@ type SimClusters struct {
 	config *Config
 	mu     sync.RWMutex
 
-	// Indices
 	graphIndex *GraphIndex
 
 	MaxConcurrency int
-
-	// State tracking
-	needsFullRecompute bool
-	updateEpoch        int64
 }
 
 // NewSimClusters creates a new SimClusters instance
@@ -37,11 +33,9 @@ func NewSimClusters(config *Config) *SimClusters {
 	}
 
 	return &SimClusters{
-		config:             config,
-		graphIndex:         NewGraphIndex(),
-		needsFullRecompute: true,
-		updateEpoch:        0,
-		MaxConcurrency:     runtime.NumCPU(),
+		config:         config,
+		graphIndex:     NewGraphIndex(),
+		MaxConcurrency: runtime.NumCPU(),
 	}
 }
 
@@ -139,6 +133,7 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	infMatrix := make(map[matKey]float32)
 
 	norms := make(map[int64]float64)
+	minhashes := make(map[int64]*MinHashSignature)
 
 	slog.Info("starting precomputation and run optimization")
 	barpre := progressbar.Default(int64(len(influencers)))
@@ -147,6 +142,7 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 		folset.RunOptimize()
 		norm := math.Sqrt(float64(folset.GetCardinality()))
 		norms[uidx] = norm
+		minhashes[uidx] = ComputeMinHash(folset, 128)
 		barpre.Add(1)
 	}
 	slog.Info("precomputation and run optimization complete")
@@ -155,6 +151,9 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	start := time.Now()
 	sema := make(chan struct{}, sc.MaxConcurrency)
 	var wg sync.WaitGroup
+
+	var skipped uint64
+	var underhalf, bottom90 uint64
 	for i, uid := range influencers {
 		wg.Add(1)
 		sema <- struct{}{}
@@ -167,8 +166,17 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 
 			folset := sc.graphIndex.GetFollowers(uidx)
 			normA := norms[uidx]
+			mhA := minhashes[uidx]
 
 			for _, ouid := range influencers[ix+1:] {
+				mhB := minhashes[ouid]
+				mhsim := EstimateSimilarity(mhA, mhB)
+
+				if mhsim < 0.1 {
+					atomic.AddUint64(&skipped, 1)
+					continue
+				}
+
 				ofolset := sc.graphIndex.GetFollowers(ouid)
 
 				normB := norms[ouid]
@@ -191,6 +199,8 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 
 	wg.Wait()
 	bar.Finish()
+
+	slog.Info("minhash skipped pairs", "count", skipped, "50perc", underhalf, "90perc", bottom90)
 
 	var minval float32 = 100000000
 	var maxval, sum float32
