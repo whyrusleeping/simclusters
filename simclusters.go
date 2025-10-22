@@ -48,6 +48,7 @@ func NewSimClusters(config *Config) *SimClusters {
 // IngestEdges adds multiple edges to the graph
 func (sc *SimClusters) IngestEdges(edges []Edge) {
 	sc.graphIndex.AddEdges(edges)
+	//sc.graphIndex.AddEdgesBatch(edges) // not using this for now because it uses too much extra memory
 }
 
 // ComputeClusters performs the full clustering computation
@@ -117,11 +118,7 @@ func (sc *SimClusters) identifyInfluencers() []int64 {
 
 // Expects normA := math.Sqrt(float64(a.GetCardinality()))
 // to be passed in so we don't have to redo this operation over and over again
-func BitmapCosineSimilarity(normA float64, a, b *roaring64.Bitmap) float32 {
-
-	//normA := math.Sqrt(float64(a.GetCardinality())) // sqrt of count
-	normB := math.Sqrt(float64(b.GetCardinality()))
-
+func BitmapCosineSimilarity(normA, normB float64, a, b *roaring64.Bitmap) float32 {
 	if normA == 0 || normB == 0 {
 		return 0
 	}
@@ -141,6 +138,19 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	var ilk sync.Mutex
 	infMatrix := make(map[matKey]float32)
 
+	norms := make(map[int64]float64)
+
+	slog.Info("starting precomputation and run optimization")
+	barpre := progressbar.Default(int64(len(influencers)))
+	for _, uidx := range influencers {
+		folset := sc.graphIndex.GetFollowers(uidx)
+		folset.RunOptimize()
+		norm := math.Sqrt(float64(folset.GetCardinality()))
+		norms[uidx] = norm
+		barpre.Add(1)
+	}
+	slog.Info("precomputation and run optimization complete")
+
 	bar := progressbar.Default(int64(len(influencers)))
 	start := time.Now()
 	sema := make(chan struct{}, sc.MaxConcurrency)
@@ -156,12 +166,14 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 			}()
 
 			folset := sc.graphIndex.GetFollowers(uidx)
-			normA := math.Sqrt(float64(folset.GetCardinality()))
+			normA := norms[uidx]
 
 			for _, ouid := range influencers[ix+1:] {
 				ofolset := sc.graphIndex.GetFollowers(ouid)
 
-				val := BitmapCosineSimilarity(normA, folset, ofolset)
+				normB := norms[ouid]
+
+				val := BitmapCosineSimilarity(normA, normB, folset, ofolset)
 
 				if val < minThresh {
 					continue

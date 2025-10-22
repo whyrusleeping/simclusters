@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/schollz/progressbar/v3"
 	smap "github.com/zolstein/sync-map"
 )
 
@@ -89,6 +90,7 @@ func (gi *GraphIndex) AddEdge(from, to int64) {
 }
 */
 
+// This uses a lot more memory
 func (gi *GraphIndex) AddEdgesBatch(edges []Edge) {
 	following := make(map[int64]*roaring64.Bitmap)
 	followers := make(map[int64]*roaring64.Bitmap)
@@ -206,6 +208,42 @@ func (gi *GraphIndex) AddEdges(edges []Edge) {
 			touser.FollowerCount++
 		}
 	}
+}
+
+func (gi *GraphIndex) OptimizeIndex() {
+	bar := progressbar.Default(-1)
+
+	sema := make(chan struct{}, 100)
+	var wg sync.WaitGroup
+	gi.Following.Range(func(user int64, vals *roaring64.Bitmap) bool {
+		wg.Add(1)
+		sema <- struct{}{}
+		go func(bm *roaring64.Bitmap) {
+			defer func() {
+				bar.Add(1)
+				<-sema
+				wg.Done()
+			}()
+			bm.RunOptimize()
+		}(vals)
+		return true
+	})
+
+	gi.Followers.Range(func(user int64, vals *roaring64.Bitmap) bool {
+		wg.Add(1)
+		sema <- struct{}{}
+		go func(bm *roaring64.Bitmap) {
+			defer func() {
+				bar.Add(1)
+				<-sema
+				wg.Done()
+			}()
+			bm.RunOptimize()
+		}(vals)
+		return true
+	})
+
+	wg.Wait()
 }
 
 // GetFollowing returns the bitmap of users that a given user follows
