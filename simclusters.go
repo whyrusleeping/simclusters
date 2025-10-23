@@ -2,6 +2,7 @@ package simclusters
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
@@ -23,7 +24,12 @@ type SimClusters struct {
 
 	graphIndex *GraphIndex
 
+	influencerMatrix map[matKey]float32
+
 	MaxConcurrency int
+
+	// CheckpointPath is the optional path to save/load checkpoints
+	CheckpointPath string
 }
 
 // NewSimClusters creates a new SimClusters instance
@@ -41,8 +47,8 @@ func NewSimClusters(config *Config) *SimClusters {
 
 // IngestEdges adds multiple edges to the graph
 func (sc *SimClusters) IngestEdges(edges []Edge) {
-	sc.graphIndex.AddEdges(edges)
-	//sc.graphIndex.AddEdgesBatch(edges) // not using this for now because it uses too much extra memory
+	//sc.graphIndex.AddEdges(edges)
+	sc.graphIndex.AddEdgesBatch(edges) // not using this for now because it uses too much extra memory
 }
 
 // ComputeClusters performs the full clustering computation
@@ -58,10 +64,21 @@ func (sc *SimClusters) ComputeClusters() error {
 	slog.Info("Initializing clusters...", "count", len(influencers))
 	matrix := sc.initializeInfluencerEdges(influencers, 0.1)
 
+	sc.influencerMatrix = matrix
+
+	// Save checkpoint after expensive computation if checkpoint path is set
+	if sc.CheckpointPath != "" {
+		slog.Info("Saving checkpoint after initializeInfluencerEdges...")
+		if err := sc.SaveCheckpoint(); err != nil {
+			slog.Error("Failed to save checkpoint", "error", err)
+			return fmt.Errorf("checkpoint save failed: %w", err)
+		}
+	}
+
 	// influencer graph
 	g := NewGraph(matrix)
 
-	influencerCommunities := MetropolisHastings(g, 1000, 10000)
+	influencerCommunities := ConcurrentMHSearch(g, 1000, 10000, 100, 100)
 
 	slog.Info("computed influencer communities", "count", len(influencerCommunities))
 
@@ -77,6 +94,65 @@ func (sc *SimClusters) ComputeClusters() error {
 	return json.NewEncoder(fi).Encode(clusters)
 	//sc.needsFullRecompute = false
 	//sc.updateEpoch++
+}
+
+// ComputeClustersFromCheckpoint loads state from checkpoint and continues with Metropolis-Hastings
+func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) error {
+	slog.Info("Loading checkpoint to resume computation...", "path", checkpointPath)
+
+	state, err := LoadCheckpoint(checkpointPath)
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoint: %w", err)
+	}
+
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	// Restore state
+	sc.graphIndex = state.GraphIndex
+	sc.influencerMatrix = state.InfluencerMatrix
+	influencers := state.Influencers
+
+	slog.Info("Checkpoint loaded", "influencers", len(influencers), "matrix_edges", len(sc.influencerMatrix))
+
+	// Continue with clustering from the checkpoint
+	g := NewGraph(sc.influencerMatrix)
+
+	influencerCommunities := ConcurrentMHSearch(g, 1000, 10000, 100, 100)
+
+	slog.Info("computed influencer communities", "count", len(influencerCommunities))
+
+	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities, 1000, 0.1)
+
+	slog.Info("writing output clusters...")
+	fi, err := os.Create("mapping.json")
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	return json.NewEncoder(fi).Encode(clusters)
+}
+
+// SaveCheckpoint saves the current state to disk
+func (sc *SimClusters) SaveCheckpoint() error {
+	if sc.CheckpointPath == "" {
+		return fmt.Errorf("checkpoint path not set")
+	}
+
+	// Collect influencers list
+	influencers := make([]int64, 0, len(sc.graphIndex.Influencers))
+	for uid := range sc.graphIndex.Influencers {
+		influencers = append(influencers, uid)
+	}
+
+	state := &CheckpointState{
+		Influencers:      influencers,
+		InfluencerMatrix: sc.influencerMatrix,
+		GraphIndex:       sc.graphIndex,
+	}
+
+	return SaveCheckpoint(sc.CheckpointPath, state)
 }
 
 // identifyInfluencers finds users with follower count above threshold
@@ -126,26 +202,50 @@ type matKey struct {
 	B int64
 }
 
-func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh float32) map[matKey]float32 {
-	slices.Sort(influencers)
-
-	var ilk sync.Mutex
-	infMatrix := make(map[matKey]float32)
-
+func (sc *SimClusters) influencerMatrixPrecomputation(influencers []int64) (map[int64]float64, map[int64]*MinHashSignature) {
 	norms := make(map[int64]float64)
 	minhashes := make(map[int64]*MinHashSignature)
+	var maplk sync.Mutex
+
+	var wg sync.WaitGroup
+	sema := make(chan struct{}, sc.MaxConcurrency)
 
 	slog.Info("starting precomputation and run optimization")
 	barpre := progressbar.Default(int64(len(influencers)))
-	for _, uidx := range influencers {
-		folset := sc.graphIndex.GetFollowers(uidx)
-		folset.RunOptimize()
-		norm := math.Sqrt(float64(folset.GetCardinality()))
-		norms[uidx] = norm
-		minhashes[uidx] = ComputeMinHash(folset, 128)
-		barpre.Add(1)
+	for _, uid := range influencers {
+		wg.Add(1)
+		sema <- struct{}{}
+		go func(uidx int64) {
+			defer func() {
+				wg.Done()
+				<-sema
+			}()
+			folset := sc.graphIndex.GetFollowers(uidx)
+			folset.RunOptimize()
+			norm := math.Sqrt(float64(folset.GetCardinality()))
+			mh := ComputeMinHash(folset, 128)
+
+			maplk.Lock()
+			norms[uidx] = norm
+			minhashes[uidx] = mh
+			maplk.Unlock()
+
+			barpre.Add(1)
+		}(uid)
 	}
+	wg.Wait()
 	slog.Info("precomputation and run optimization complete")
+
+	return norms, minhashes
+}
+
+func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh float32) map[matKey]float32 {
+	slices.Sort(influencers)
+
+	norms, minhashes := sc.influencerMatrixPrecomputation(influencers)
+
+	var ilk sync.Mutex
+	infMatrix := make(map[matKey]float32)
 
 	bar := progressbar.Default(int64(len(influencers)))
 	start := time.Now()
@@ -172,7 +272,7 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 				mhB := minhashes[ouid]
 				mhsim := EstimateSimilarity(mhA, mhB)
 
-				if mhsim < 0.1 {
+				if mhsim < minThresh {
 					atomic.AddUint64(&skipped, 1)
 					continue
 				}
@@ -267,12 +367,105 @@ func initializeRandomAssignment(graph *Graph, numCommunities int) map[int64]int 
 	return assignment
 }
 
-func MetropolisHastings(graph *Graph, numCommunities, maxIters int) map[int64]int {
-	temperature := float32(1.0)
+func copyAssignment(a map[int64]int) map[int64]int {
+	nmap := make(map[int64]int, len(a))
+	for k, v := range a {
+		nmap[k] = v
+	}
+	return nmap
+}
+
+func ConcurrentMHSearch(graph *Graph, numCommunities, itersPerLoop, totalLoops, concurrency int) map[int64]int {
+	// start by generating some number of random starting assignments, and then picking the one with highest modularity
+	slog.Info("doing a search for a decent starting position...")
+
+	startingAssignment, modularity := initializationSearch(graph, numCommunities, concurrency)
+	slog.Info("starting assignment found", "modularity", modularity)
+
+	cur := startingAssignment
+
+	startTemp := float32(2.5)
+	endTemp := float32(0.1)
+
+	for i := 0; i < totalLoops; i++ {
+		progress := float32(i) / float32(totalLoops-1)
+		temperature := startTemp * float32(math.Pow(float64(endTemp/startTemp), float64(progress)))
+
+		next, nmod := mhSearchRound(graph, cur, numCommunities, concurrency, itersPerLoop, temperature)
+
+		slog.Info("mh search round complete", "round", i, "modularity", nmod)
+
+		modularity = nmod
+		cur = next
+	}
+
+	return cur
+}
+
+func mhSearchRound(graph *Graph, assignment map[int64]int, numCommunities, concurrency, numIters int, temperature float32) (map[int64]int, float32) {
+	var lk sync.Mutex
+	var best map[int64]int
+	var bestScore float32
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		mcopy := copyAssignment(assignment)
+
+		wg.Go(func() {
+			nassign, nmod := MetropolisHastings(graph, mcopy, numCommunities, numIters, temperature)
+
+			lk.Lock()
+			if nmod > bestScore {
+				bestScore = nmod
+				best = nassign
+			}
+			lk.Unlock()
+		})
+	}
+
+	wg.Wait()
+
+	return best, bestScore
+}
+
+func initializationSearch(graph *Graph, numCommunities, concurrency int) (map[int64]int, float32) {
+	var lk sync.Mutex
+	var best map[int64]int
+	var bestScore float32
+
+	var wg sync.WaitGroup
+	sema := make(chan struct{}, concurrency)
+
+	for i := 0; i < 1000; i++ {
+		sema <- struct{}{}
+		wg.Go(func() {
+			defer func() {
+				<-sema
+			}()
+
+			assignment := initializeRandomAssignment(graph, numCommunities)
+			mod := computeModularity(graph, assignment, numCommunities)
+
+			lk.Lock()
+			if mod > bestScore {
+				bestScore = mod
+				best = assignment
+			}
+			lk.Unlock()
+		})
+	}
+
+	wg.Wait()
+
+	return best, bestScore
+}
+
+func MetropolisHastings(graph *Graph, startingAssignment map[int64]int, numCommunities, maxIters int, temperature float32) (map[int64]int, float32) {
 	//rand.Seed(config.RandomSeed)
 
 	// Initialize random community assignments
-	assignment := initializeRandomAssignment(graph, numCommunities)
+	assignment := startingAssignment
 
 	// Precompute node degrees and total weight (these don't change)
 	degree := make(map[int64]float32)
@@ -313,7 +506,7 @@ func MetropolisHastings(graph *Graph, numCommunities, maxIters int) map[int64]in
 		// If rejected, assignment stays the same (no revert needed)
 	}
 
-	return assignment
+	return assignment, currentScore
 }
 
 func computeModularity(graph *Graph, assignment map[int64]int, numCommunities int) float32 {

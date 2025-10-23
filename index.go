@@ -27,23 +27,19 @@ type GraphIndex struct {
 
 	// Influencer tracking
 	Influencers map[int64]bool
-
-	// Deduplication mapping: user ID -> canonical user ID
-	CanonicalMapping map[int64]int64
 }
 
-const numLocks = 20
+const numLocks = 100
 
 // NewGraphIndex creates a new graph index
 func NewGraphIndex() *GraphIndex {
 	return &GraphIndex{
 		//Following:        make(map[int64]*roaring64.Bitmap),
 		//Followers:        make(map[int64]*roaring64.Bitmap),
-		followingLks:     make([]sync.Mutex, numLocks),
-		followersLks:     make([]sync.Mutex, numLocks),
-		Users:            make(map[int64]*User),
-		Influencers:      make(map[int64]bool),
-		CanonicalMapping: make(map[int64]int64),
+		followingLks: make([]sync.Mutex, numLocks),
+		followersLks: make([]sync.Mutex, numLocks),
+		Users:        make(map[int64]*User),
+		Influencers:  make(map[int64]bool),
 	}
 }
 

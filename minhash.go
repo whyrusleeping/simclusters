@@ -73,12 +73,51 @@ func EstimateSimilarity(sig1, sig2 *MinHashSignature) float32 {
 		return 0
 	}
 
+	matches := countMatchesScalar(sig1.Hashes, sig2.Hashes)
+
+	return float32(matches) / float32(sig1.NumHash)
+}
+
+func countMatchesScalar(a, b []uint32) int {
+	n := len(a)
 	matches := 0
-	for i := 0; i < sig1.NumHash; i++ {
-		if sig1.Hashes[i] == sig2.Hashes[i] {
+
+	// Process 8 at a time (unrolled for better ILP)
+	i := 0
+	for ; i+7 < n; i += 8 {
+		// Modern CPUs can execute these comparisons in parallel
+		if a[i] == b[i] {
+			matches++
+		}
+		if a[i+1] == b[i+1] {
+			matches++
+		}
+		if a[i+2] == b[i+2] {
+			matches++
+		}
+		if a[i+3] == b[i+3] {
+			matches++
+		}
+		if a[i+4] == b[i+4] {
+			matches++
+		}
+		if a[i+5] == b[i+5] {
+			matches++
+		}
+		if a[i+6] == b[i+6] {
+			matches++
+		}
+		if a[i+7] == b[i+7] {
 			matches++
 		}
 	}
 
-	return float32(matches) / float32(sig1.NumHash)
+	// Handle remainder
+	for ; i < n; i++ {
+		if a[i] == b[i] {
+			matches++
+		}
+	}
+
+	return matches
 }

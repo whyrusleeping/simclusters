@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -13,12 +14,37 @@ import (
 	"sync"
 
 	"github.com/schollz/progressbar/v3"
+	"github.com/urfave/cli/v3"
 	"github.com/whyrusleeping/simclusters"
 )
 
 func main() {
-	if err := runMain(); err != nil {
-		fmt.Println(err)
+	// Start pprof server
+	go func() {
+		http.ListenAndServe(":9123", nil)
+	}()
+
+	cmd := &cli.Command{
+		Name:  "simmy",
+		Usage: "SimClusters algorithm implementation",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "checkpoint",
+				Aliases: []string{"c"},
+				Usage:   "Path to save checkpoint after initializeInfluencerEdges",
+			},
+			&cli.StringFlag{
+				Name:    "from-checkpoint",
+				Aliases: []string{"f"},
+				Usage:   "Path to load checkpoint and resume computation",
+			},
+		},
+		Action: runClustering,
+	}
+
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
@@ -27,6 +53,7 @@ func loadEdgesFromFile(simc *simclusters.SimClusters, fn string) error {
 	if err != nil {
 		return err
 	}
+	defer fi.Close()
 
 	rr := csv.NewReader(fi)
 
@@ -35,6 +62,9 @@ func loadEdgesFromFile(simc *simclusters.SimClusters, fn string) error {
 		rec, err := rr.Read()
 		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			return err
 		}
 
 		from, err := strconv.Atoi(rec[1])
@@ -58,16 +88,30 @@ func loadEdgesFromFile(simc *simclusters.SimClusters, fn string) error {
 	return nil
 }
 
-func runMain() error {
-	//fi, err := os.Open("/home/why/follows.csv")
-	go func() {
-		http.ListenAndServe(":9123", nil)
-	}()
-
+func runClustering(ctx context.Context, cmd *cli.Command) error {
 	cfg := simclusters.DefaultConfig()
 	simc := simclusters.NewSimClusters(cfg)
 
-	files := os.Args[1:]
+	checkpointPath := cmd.String("checkpoint")
+	fromCheckpoint := cmd.String("from-checkpoint")
+
+	// Set checkpoint path if provided
+	if checkpointPath != "" {
+		simc.CheckpointPath = checkpointPath
+		slog.Info("Checkpoint will be saved to", "path", checkpointPath)
+	}
+
+	// If resuming from checkpoint, skip data loading
+	if fromCheckpoint != "" {
+		slog.Info("Resuming computation from checkpoint", "path", fromCheckpoint)
+		return simc.ComputeClustersFromCheckpoint(fromCheckpoint)
+	}
+
+	// Load data files
+	files := cmd.Args().Slice()
+	if len(files) == 0 {
+		return fmt.Errorf("no input files provided")
+	}
 
 	bar := progressbar.Default(int64(len(files)))
 	var wg sync.WaitGroup
