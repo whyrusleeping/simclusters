@@ -157,9 +157,15 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 	slog.Info("Checkpoint loaded", "influencers", len(influencers), "matrix_edges", len(sc.influencerMatrix))
 
 	// Continue with clustering from the checkpoint
+	for k, v := range sc.influencerMatrix {
+		if v < 0.4 {
+			delete(sc.influencerMatrix, k)
+		}
+	}
+
 	g := NewGraph(sc.influencerMatrix)
 
-	influencerCommunities := ConcurrentMHSearch(g, 10_000, 40000, 400, sc.MaxConcurrency, false)
+	influencerCommunities := ConcurrentMHSearch(g, 10_000, 10000, 400, sc.MaxConcurrency, false)
 
 	// Count unique communities
 	uniqueCommunities := make(map[int]bool)
@@ -417,6 +423,18 @@ func NewGraph(edges map[matKey]float64) *Graph {
 		g.Nodes = append(g.Nodes, nd)
 	}
 
+	for _, v := range g.Neighbors {
+		slices.SortFunc(v, func(a, b neighborWeight) int {
+			if a.Weight > b.Weight {
+				return -1
+			}
+			if a.Weight < b.Weight {
+				return 1
+			}
+			return 0
+		})
+	}
+
 	return g
 }
 
@@ -632,43 +650,95 @@ type mhPrecomputes struct {
 }
 
 func MetropolisHastings(graph *Graph, startingAssignment map[int64]int, currentScore float64, numCommunities, maxIters int, temperature float64, pc *mhPrecomputes) (map[int64]int, float64) {
-	//rand.Seed(config.RandomSeed)
+	// Neighborhood-aware Metropolis-Hastings:
+	// - Candidate communities are picked from neighbors' communities
+	// - Sample with probability proportional to e^(delta/temperature) (softmax)
 
-	// Initialize random community assignments
 	assignment := startingAssignment
 
-	// Precompute node degrees and total weight (these don't change)
-
-	// Metropolis-Hastings sampling
 	for iter := 0; iter < maxIters; iter++ {
-		// Propose a move: pick a random node and random new community
+		// Pick a random node
 		node := graph.Nodes[rand.Intn(len(graph.Nodes))]
 		oldCommunity := assignment[node]
-		newCommunity := rand.Intn(numCommunities)
 
-		// Skip if same community
-		if oldCommunity == newCommunity {
+		// Collect communities of neighbors
+		neighborCommunities := make(map[int]bool)
+		for _, neighbor := range graph.Neighbors[node] {
+			comm := assignment[neighbor.Node]
+			neighborCommunities[comm] = true
+		}
+
+		// If no neighbors or all neighbors are in same community as node, skip
+		if len(neighborCommunities) == 0 {
+			continue
+		}
+		if len(neighborCommunities) == 1 && neighborCommunities[oldCommunity] {
 			continue
 		}
 
-		// Compute delta modularity (change from moving this node)
-		deltaScore := computeModularityDelta(graph, assignment, node, oldCommunity, newCommunity, pc)
-
-		// Acceptance probability
-		acceptProb := float64(math.Min(1.0, math.Exp(float64(deltaScore/temperature))))
-
-		// Accept or reject
-		if rand.Float64() < acceptProb {
-			// Accept the move
-			assignment[node] = newCommunity
-			currentScore += deltaScore
-
-			// Update community degrees
-			k := pc.degree[node]
-			pc.communityDegrees[oldCommunity] -= k
-			pc.communityDegrees[newCommunity] += k
+		// Compute delta modularity for each candidate community
+		type candidate struct {
+			community int
+			delta     float64
 		}
-		// If rejected, assignment stays the same (no revert needed)
+
+		candidates := make([]candidate, 0, len(neighborCommunities))
+		for comm := range neighborCommunities {
+			if comm == oldCommunity {
+				continue // Don't move to same community
+			}
+			delta := computeModularityDelta(graph, assignment, node, oldCommunity, comm, pc)
+			candidates = append(candidates, candidate{community: comm, delta: delta})
+		}
+
+		if len(candidates) == 0 {
+			continue
+		}
+
+		// Apply softmax: P(c) = e^(delta_c/T) / Σ e^(delta_i/T)
+		// For numerical stability, subtract max delta before exponentiating
+		maxDelta := candidates[0].delta
+		for _, c := range candidates {
+			if c.delta > maxDelta {
+				maxDelta = c.delta
+			}
+		}
+
+		// Compute unnormalized probabilities
+		probs := make([]float64, len(candidates))
+		sumProbs := 0.0
+		for i, c := range candidates {
+			probs[i] = math.Exp((c.delta - maxDelta) / temperature)
+			sumProbs += probs[i]
+		}
+
+		// Normalize
+		for i := range probs {
+			probs[i] /= sumProbs
+		}
+
+		// Sample a community according to softmax distribution
+		r := rand.Float64()
+		cumProb := 0.0
+		var newCommunity int
+		var deltaScore float64
+		for i, prob := range probs {
+			cumProb += prob
+			if r <= cumProb {
+				newCommunity = candidates[i].community
+				deltaScore = candidates[i].delta
+				break
+			}
+		}
+
+		// Make the move
+		assignment[node] = newCommunity
+		currentScore += deltaScore
+
+		// Update community degrees
+		k := pc.degree[node]
+		pc.communityDegrees[oldCommunity] -= k
+		pc.communityDegrees[newCommunity] += k
 	}
 
 	return assignment, currentScore
@@ -813,7 +883,7 @@ func computeModularityDelta(
 	var dLold, dLnew float64
 	for _, neighbor := range graph.Neighbors[node] {
 		neighborComm := assignment[neighbor.Node]
-		if neighborComm == oldCommunity && neighbor.Node != node {
+		if neighborComm == oldCommunity { // && neighbor.Node != node { // this extra condition should be impossible
 			dLold += neighbor.Weight
 		}
 		if neighborComm == newCommunity {
