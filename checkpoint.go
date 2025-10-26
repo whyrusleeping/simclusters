@@ -23,7 +23,7 @@ const progressFreq = 10000
 // CheckpointState represents the state to be saved/loaded
 type CheckpointState struct {
 	Influencers      []int64
-	InfluencerMatrix map[matKey]float32
+	InfluencerMatrix map[matKey]float64
 	GraphIndex       *GraphIndex
 }
 
@@ -42,7 +42,7 @@ type CheckpointMetadata struct {
 type matKeyJSON struct {
 	A int64   `json:"a"`
 	B int64   `json:"b"`
-	V float32 `json:"v"`
+	V float64 `json:"v"`
 }
 
 // SaveCheckpoint saves the state to a directory
@@ -87,32 +87,28 @@ func SaveCheckpoint(dirPath string, state *CheckpointState) error {
 		return nil
 	})
 
-	// Save influencers
+	// Save influencers (binary format)
 	errgrp.Go(func() error {
 		slog.Info("Saving influencers", "count", len(state.Influencers))
-		if err := saveJSON(filepath.Join(dirPath, "influencers.json"), state.Influencers); err != nil {
+		if err := saveInfluencers(filepath.Join(dirPath, "influencers.bin"), state.Influencers); err != nil {
 			return fmt.Errorf("failed to save influencers: %w", err)
 		}
 		return nil
 	})
 
-	// Save influencer matrix (convert to JSON-friendly format)
+	// Save influencer matrix (binary format)
 	errgrp.Go(func() error {
 		slog.Info("Saving influencer matrix", "edges", len(state.InfluencerMatrix))
-		matrixSlice := make([]matKeyJSON, 0, len(state.InfluencerMatrix))
-		for key, val := range state.InfluencerMatrix {
-			matrixSlice = append(matrixSlice, matKeyJSON{A: key.A, B: key.B, V: val})
-		}
-		if err := saveJSON(filepath.Join(dirPath, "matrix.json"), matrixSlice); err != nil {
+		if err := saveMatrix(filepath.Join(dirPath, "matrix.bin"), state.InfluencerMatrix); err != nil {
 			return fmt.Errorf("failed to save matrix: %w", err)
 		}
 		return nil
 	})
 
-	// Save users
+	// Save users (binary format)
 	errgrp.Go(func() error {
 		slog.Info("Saving users", "count", len(state.GraphIndex.Users))
-		if err := saveJSON(filepath.Join(dirPath, "users.json"), state.GraphIndex.Users); err != nil {
+		if err := saveUsers(filepath.Join(dirPath, "users.bin"), state.GraphIndex.Users); err != nil {
 			return fmt.Errorf("failed to save users: %w", err)
 		}
 		return nil
@@ -180,37 +176,38 @@ func LoadCheckpoint(dirPath string) (*CheckpointState, error) {
 
 	var errgrp errgroup.Group
 
-	// Load influencers
+	// Load influencers (binary format)
 	errgrp.Go(func() error {
 		slog.Info("Loading influencers...")
-		if err := loadJSON(filepath.Join(dirPath, "influencers.json"), &state.Influencers); err != nil {
+		influencers, err := loadInfluencersBin(filepath.Join(dirPath, "influencers.bin"))
+		if err != nil {
 			return fmt.Errorf("failed to load influencers: %w", err)
 		}
+		state.Influencers = influencers
 		slog.Info("Influencers loaded", "count", len(state.Influencers))
 		return nil
 	})
 
-	// Load influencer matrix
+	// Load influencer matrix (binary format)
 	errgrp.Go(func() error {
 		slog.Info("Loading influencer matrix...")
-		var matrixSlice []matKeyJSON
-		if err := loadJSON(filepath.Join(dirPath, "matrix.json"), &matrixSlice); err != nil {
+		matrix, err := loadMatrixBin(filepath.Join(dirPath, "matrix.bin"))
+		if err != nil {
 			return fmt.Errorf("failed to load matrix: %w", err)
 		}
-		state.InfluencerMatrix = make(map[matKey]float32, len(matrixSlice))
-		for _, item := range matrixSlice {
-			state.InfluencerMatrix[matKey{A: item.A, B: item.B}] = item.V
-		}
+		state.InfluencerMatrix = matrix
 		slog.Info("Influencer matrix loaded", "edges", len(state.InfluencerMatrix))
 		return nil
 	})
 
-	// Load users
+	// Load users (binary format)
 	errgrp.Go(func() error {
 		slog.Info("Loading users...")
-		if err := loadJSON(filepath.Join(dirPath, "users.json"), &state.GraphIndex.Users); err != nil {
+		users, err := loadUsersBin(filepath.Join(dirPath, "users.bin"))
+		if err != nil {
 			return fmt.Errorf("failed to load users: %w", err)
 		}
+		state.GraphIndex.Users = users
 		slog.Info("Users loaded", "count", len(state.GraphIndex.Users))
 		return nil
 	})
@@ -417,4 +414,236 @@ func getDirSize(path string) (int64, error) {
 		return nil
 	})
 	return size, err
+}
+
+// saveInfluencers saves influencer IDs in binary format
+// Format: [count: int64][id: int64]...
+func saveInfluencers(path string, influencers []int64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 256*1024)
+	defer w.Flush()
+
+	// Write count
+	count := int64(len(influencers))
+	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
+		return fmt.Errorf("failed to write count: %w", err)
+	}
+
+	// Write influencer IDs
+	for i, id := range influencers {
+		if err := binary.Write(w, binary.LittleEndian, id); err != nil {
+			return fmt.Errorf("failed to write influencer ID: %w", err)
+		}
+		if (i+1)%progressFreq == 0 {
+			slog.Debug("Influencer save progress", "saved", i+1, "total", len(influencers))
+		}
+	}
+
+	return w.Flush()
+}
+
+// loadInfluencersBin loads influencer IDs from binary format
+func loadInfluencersBin(path string) ([]int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 256*1024)
+
+	// Read count
+	var count int64
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read count: %w", err)
+	}
+
+	// Read influencer IDs
+	influencers := make([]int64, count)
+	for i := int64(0); i < count; i++ {
+		if err := binary.Read(r, binary.LittleEndian, &influencers[i]); err != nil {
+			return nil, fmt.Errorf("failed to read influencer ID: %w", err)
+		}
+		if (i+1)%int64(progressFreq) == 0 {
+			slog.Debug("Influencer load progress", "loaded", i+1, "total", count)
+		}
+	}
+
+	return influencers, nil
+}
+
+// saveMatrix saves the influencer matrix in binary format
+// Format: [count: int64][a: int64][b: int64][val: float64]...
+func saveMatrix(path string, matrix map[matKey]float64) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 256*1024)
+	defer w.Flush()
+
+	// Write count
+	count := int64(len(matrix))
+	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
+		return fmt.Errorf("failed to write count: %w", err)
+	}
+
+	// Write matrix entries
+	i := 0
+	for key, val := range matrix {
+		if err := binary.Write(w, binary.LittleEndian, key.A); err != nil {
+			return fmt.Errorf("failed to write key.A: %w", err)
+		}
+		if err := binary.Write(w, binary.LittleEndian, key.B); err != nil {
+			return fmt.Errorf("failed to write key.B: %w", err)
+		}
+		if err := binary.Write(w, binary.LittleEndian, val); err != nil {
+			return fmt.Errorf("failed to write value: %w", err)
+		}
+		i++
+		if i%progressFreq == 0 {
+			slog.Debug("Matrix save progress", "saved", i, "total", len(matrix))
+		}
+	}
+
+	return w.Flush()
+}
+
+// loadMatrixBin loads the influencer matrix from binary format
+func loadMatrixBin(path string) (map[matKey]float64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 256*1024)
+
+	// Read count
+	var count int64
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read count: %w", err)
+	}
+
+	// Read matrix entries
+	matrix := make(map[matKey]float64, count)
+	for i := int64(0); i < count; i++ {
+		var a, b int64
+		var val float64
+
+		if err := binary.Read(r, binary.LittleEndian, &a); err != nil {
+			return nil, fmt.Errorf("failed to read key.A: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &b); err != nil {
+			return nil, fmt.Errorf("failed to read key.B: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &val); err != nil {
+			return nil, fmt.Errorf("failed to read value: %w", err)
+		}
+
+		matrix[matKey{A: a, B: b}] = val
+
+		if (i+1)%int64(progressFreq) == 0 {
+			slog.Debug("Matrix load progress", "loaded", i+1, "total", count)
+		}
+	}
+
+	return matrix, nil
+}
+
+// saveUsers saves user metadata in binary format
+// Format: [count: int64][id: int64][followerCount: int32][isInfluencer: byte]...
+func saveUsers(path string, users map[int64]*User) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriterSize(f, 256*1024)
+	defer w.Flush()
+
+	// Write count
+	count := int64(len(users))
+	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
+		return fmt.Errorf("failed to write count: %w", err)
+	}
+
+	// Write user entries
+	i := 0
+	for id, user := range users {
+		if err := binary.Write(w, binary.LittleEndian, id); err != nil {
+			return fmt.Errorf("failed to write user ID: %w", err)
+		}
+		if err := binary.Write(w, binary.LittleEndian, user.FollowerCount); err != nil {
+			return fmt.Errorf("failed to write follower count: %w", err)
+		}
+		var isInfluencer byte
+		if user.IsInfluencer {
+			isInfluencer = 1
+		}
+		if err := binary.Write(w, binary.LittleEndian, isInfluencer); err != nil {
+			return fmt.Errorf("failed to write isInfluencer: %w", err)
+		}
+		i++
+		if i%progressFreq == 0 {
+			slog.Debug("User save progress", "saved", i, "total", len(users))
+		}
+	}
+
+	return w.Flush()
+}
+
+// loadUsersBin loads user metadata from binary format
+func loadUsersBin(path string) (map[int64]*User, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 256*1024)
+
+	// Read count
+	var count int64
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read count: %w", err)
+	}
+
+	// Read user entries
+	users := make(map[int64]*User, count)
+	for i := int64(0); i < count; i++ {
+		var id int64
+		var followerCount int32
+		var isInfluencer byte
+
+		if err := binary.Read(r, binary.LittleEndian, &id); err != nil {
+			return nil, fmt.Errorf("failed to read user ID: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &followerCount); err != nil {
+			return nil, fmt.Errorf("failed to read follower count: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &isInfluencer); err != nil {
+			return nil, fmt.Errorf("failed to read isInfluencer: %w", err)
+		}
+
+		users[id] = &User{
+			ID:            id,
+			FollowerCount: followerCount,
+			IsInfluencer:  isInfluencer == 1,
+		}
+
+		if (i+1)%int64(progressFreq) == 0 {
+			slog.Debug("User load progress", "loaded", i+1, "total", count)
+		}
+	}
+
+	return users, nil
 }

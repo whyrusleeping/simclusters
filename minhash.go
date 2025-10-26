@@ -68,14 +68,14 @@ func hashWithSeed(value uint64, seed uint32) uint32 {
 }
 
 // EstimateSimilarity estimates Jaccard similarity between two MinHash signatures
-func EstimateSimilarity(sig1, sig2 *MinHashSignature) float32 {
+func EstimateSimilarity(sig1, sig2 *MinHashSignature) float64 {
 	if sig1.NumHash != sig2.NumHash {
 		return 0
 	}
 
 	matches := countMatchesScalar(sig1.Hashes, sig2.Hashes)
 
-	return float32(matches) / float32(sig1.NumHash)
+	return float64(matches) / float64(sig1.NumHash)
 }
 
 func countMatchesScalar(a, b []uint32) int {
