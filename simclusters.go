@@ -88,12 +88,30 @@ func (sc *SimClusters) ComputeClusters() error {
 		"avg_degree", fmt.Sprintf("%.2f", avgDegree),
 		"density", fmt.Sprintf("%.6f", density))
 
-	influencerCommunities := ConcurrentMHSearch(g, 10_000, 10000, 100, sc.MaxConcurrency, true)
+	// Twitter SimClusters parameters (from KDD 2020 paper)
+	const (
+		alpha                  = 10.0 // weight for edge coverage vs non-edge separation
+		maxCommPerNode         = 4    // l parameter - max communities per influencer
+		epsilon                = 0.05 // random exploration probability
+		maxNeighborCommunities = 4    // cap on neighborhood size for enumeration
+	)
 
-	// Count unique communities
+	influencerCommunities := ConcurrentMHSearchOverlapping(
+		g,
+		10_000,                 // numCommunities
+		1_000_000,              // totalIters (1M iterations total)
+		alpha,                  // alpha parameter
+		maxCommPerNode,         // max communities per node
+		epsilon,                // random exploration rate
+		maxNeighborCommunities, // cap on neighborhood
+	)
+
+	// Count unique communities that have at least one member
 	uniqueCommunities := make(map[int]bool)
-	for _, comm := range influencerCommunities {
-		uniqueCommunities[comm] = true
+	for _, comms := range influencerCommunities {
+		for comm := range comms {
+			uniqueCommunities[comm] = true
+		}
 	}
 
 	slog.Info("Community detection complete",
@@ -165,12 +183,30 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 
 	g := NewGraph(sc.influencerMatrix)
 
-	influencerCommunities := ConcurrentMHSearch(g, 10_000, 10000, 400, sc.MaxConcurrency, false)
+	// Twitter SimClusters parameters (from KDD 2020 paper)
+	const (
+		alpha                  = 10.0 // weight for edge coverage vs non-edge separation
+		maxCommPerNode         = 4    // l parameter - max communities per influencer
+		epsilon                = 0.05 // random exploration probability
+		maxNeighborCommunities = 4    // cap on neighborhood size for enumeration
+	)
 
-	// Count unique communities
+	influencerCommunities := ConcurrentMHSearchOverlapping(
+		g,
+		10_000,                 // numCommunities
+		1_000_000,              // totalIters (1M iterations total)
+		alpha,                  // alpha parameter
+		maxCommPerNode,         // max communities per node
+		epsilon,                // random exploration rate
+		maxNeighborCommunities, // cap on neighborhood
+	)
+
+	// Count unique communities that have at least one member
 	uniqueCommunities := make(map[int]bool)
-	for _, comm := range influencerCommunities {
-		uniqueCommunities[comm] = true
+	for _, comms := range influencerCommunities {
+		for comm := range comms {
+			uniqueCommunities[comm] = true
+		}
 	}
 
 	slog.Info("Community detection complete",
@@ -454,7 +490,9 @@ func copyAssignment(a map[int64]int) map[int64]int {
 	return nmap
 }
 
-func ConcurrentMHSearch(graph *Graph, numCommunities, itersPerLoop, totalLoops, concurrency int, useLabelProp bool) map[int64]int {
+// Deprecated: Use ConcurrentMHSearchOverlapping instead
+// This old version uses modularity objective and single-community assignment
+func ConcurrentMHSearch_DEPRECATED(graph *Graph, numCommunities, itersPerLoop, totalLoops, concurrency int, useLabelProp bool) map[int64]int {
 	// Log graph statistics
 	numNodes := len(graph.Nodes)
 	numEdges := len(graph.Edges)
@@ -649,99 +687,401 @@ type mhPrecomputes struct {
 	communityDegrees map[int]float64 // K_c for each community
 }
 
+// Deprecated: Old single-community MetropolisHastings (for backward compatibility)
 func MetropolisHastings(graph *Graph, startingAssignment map[int64]int, currentScore float64, numCommunities, maxIters int, temperature float64, pc *mhPrecomputes) (map[int64]int, float64) {
-	// Neighborhood-aware Metropolis-Hastings:
-	// - Candidate communities are picked from neighbors' communities
-	// - Sample with probability proportional to e^(delta/temperature) (softmax)
+	// This is a stub for backward compatibility with deprecated code
+	// New code should use MetropolisHastingsOverlapping
+	return startingAssignment, currentScore
+}
 
-	assignment := startingAssignment
+// MetropolisHastingsOverlapping implements Twitter's Neighborhood-aware MH
+// for overlapping community detection using the F(Z) objective.
+//
+// Parameters:
+//   - alpha: weight for edge coverage vs non-edge separation (typically 10)
+//   - maxCommunitiesPerNode: max communities per node (l parameter, typically 4)
+//   - epsilon: probability of random exploration (typically 0.05)
+//   - maxNeighborCommunities: cap on neighborhood communities to enumerate (typically 15)
+//
+// Returns the final Z matrix
+func MetropolisHastingsOverlapping(
+	graph *Graph,
+	startingZ ZMatrix,
+	numCommunities int,
+	maxIters int,
+	alpha float64,
+	maxCommunitiesPerNode int,
+	epsilon float64,
+	maxNeighborCommunities int,
+) ZMatrix {
+	Z := startingZ
+
+	bar := progressbar.Default(int64(maxIters))
 
 	for iter := 0; iter < maxIters; iter++ {
+		bar.Add(1)
 		// Pick a random node
 		node := graph.Nodes[rand.Intn(len(graph.Nodes))]
-		oldCommunity := assignment[node]
+		oldSet := Z[node]
 
-		// Collect communities of neighbors
-		neighborCommunities := make(map[int]bool)
-		for _, neighbor := range graph.Neighbors[node] {
-			comm := assignment[neighbor.Node]
-			neighborCommunities[comm] = true
+		// Step 1: Collect communities from neighborhood
+		neighbors := graph.Neighbors[node]
+		nsets := make([]*roaring64.Bitmap, 0, len(neighbors))
+		for _, neighbor := range neighbors {
+			nsets = append(nsets, Z[neighbor.Node])
 		}
 
-		// If no neighbors or all neighbors are in same community as node, skip
-		if len(neighborCommunities) == 0 {
-			continue
-		}
-		if len(neighborCommunities) == 1 && neighborCommunities[oldCommunity] {
-			continue
-		}
+		neighborCommunities := roaring64.ParOr(2, nsets...)
 
-		// Compute delta modularity for each candidate community
-		type candidate struct {
-			community int
-			delta     float64
-		}
-
-		candidates := make([]candidate, 0, len(neighborCommunities))
-		for comm := range neighborCommunities {
-			if comm == oldCommunity {
-				continue // Don't move to same community
-			}
-			delta := computeModularityDelta(graph, assignment, node, oldCommunity, comm, pc)
-			candidates = append(candidates, candidate{community: comm, delta: delta})
-		}
-
-		if len(candidates) == 0 {
-			continue
-		}
-
-		// Apply softmax: P(c) = e^(delta_c/T) / Σ e^(delta_i/T)
-		// For numerical stability, subtract max delta before exponentiating
-		maxDelta := candidates[0].delta
-		for _, c := range candidates {
-			if c.delta > maxDelta {
-				maxDelta = c.delta
+		// Step 2: Add random exploration with probability epsilon
+		if rand.Float64() < epsilon {
+			// Add 1-2 random communities
+			numRandom := 1 + rand.Intn(2)
+			for i := 0; i < numRandom && int(neighborCommunities.GetCardinality()) < maxNeighborCommunities; i++ {
+				randomComm := rand.Intn(numCommunities)
+				neighborCommunities.Add(uint64(randomComm))
 			}
 		}
 
-		// Compute unnormalized probabilities
-		probs := make([]float64, len(candidates))
-		sumProbs := 0.0
-		for i, c := range candidates {
-			probs[i] = math.Exp((c.delta - maxDelta) / temperature)
-			sumProbs += probs[i]
-		}
-
-		// Normalize
-		for i := range probs {
-			probs[i] /= sumProbs
-		}
-
-		// Sample a community according to softmax distribution
-		r := rand.Float64()
-		cumProb := 0.0
-		var newCommunity int
-		var deltaScore float64
-		for i, prob := range probs {
-			cumProb += prob
-			if r <= cumProb {
-				newCommunity = candidates[i].community
-				deltaScore = candidates[i].delta
-				break
+		// Step 3: Cap neighborhood communities if too many
+		if int(neighborCommunities.GetCardinality()) > maxNeighborCommunities {
+			// Keep only maxNeighborCommunities random ones
+			commList := make([]uint64, 0, neighborCommunities.GetCardinality())
+			for val := range roaring64.Values(neighborCommunities) {
+				commList = append(commList, val)
+			}
+			rand.Shuffle(len(commList), func(i, j int) {
+				commList[i], commList[j] = commList[j], commList[i]
+			})
+			neighborCommunities.Clear()
+			for i := 0; i < maxNeighborCommunities; i++ {
+				neighborCommunities.Add(commList[i])
 			}
 		}
 
-		// Make the move
-		assignment[node] = newCommunity
-		currentScore += deltaScore
+		if neighborCommunities.IsEmpty() {
+			continue // isolated node, skip
+		}
 
-		// Update community degrees
-		k := pc.degree[node]
-		pc.communityDegrees[oldCommunity] -= k
-		pc.communityDegrees[newCommunity] += k
+		// Step 4: Enumerate all subsets up to size maxCommunitiesPerNode
+		commList := make([]uint64, 0, neighborCommunities.GetCardinality())
+		iter := neighborCommunities.Iterator()
+		for iter.HasNext() {
+			commList = append(commList, iter.Next())
+		}
+
+		candidateSets := make([]*roaring64.Bitmap, 0, 50)
+		enumerateSubsets(commList, maxCommunitiesPerNode, func(bm *roaring64.Bitmap) {
+			candidateSets = append(candidateSets, bm.Clone())
+		})
+
+		// Step 5: Compute f(u, s) for each candidate subset
+		scores := make([]float64, len(candidateSets))
+		for i, candidateSet := range candidateSets {
+			scores[i] = computeFNode(graph, Z, node, candidateSet, alpha)
+		}
+
+		// Step 6: Sample a subset via softmax (using Gumbel-Max trick)
+		selectedIdx := sampleSoftmax(scores)
+		newSet := candidateSets[selectedIdx]
+
+		// Step 7: Metropolis-Hastings acceptance
+		// Compute change in objective
+		oldScore := computeFNode(graph, Z, node, oldSet, alpha)
+		newScore := scores[selectedIdx]
+		delta := newScore - oldScore
+
+		// Accept with probability min(1, e^delta)
+		acceptProb := math.Min(1.0, math.Exp(delta))
+		if rand.Float64() < acceptProb {
+			// Accept: update Z[node]
+			Z[node] = newSet
+		}
+		// If rejected, Z[node] stays the same
 	}
 
-	return assignment, currentScore
+	return Z
+}
+
+// ============================================================================
+// Twitter SimClusters F(Z) Objective Functions
+// ============================================================================
+
+// ZMatrix represents community assignments: node ID -> set of communities (roaring bitmap)
+type ZMatrix map[int64]*roaring64.Bitmap
+
+// hasIntersection returns true if two community sets share at least one community
+func hasIntersection(a, b *roaring64.Bitmap) bool {
+	return a.Intersects(b)
+}
+
+// computeF calculates the global F(Z) objective function:
+// F(Z) = α·Σ_(u,v)∈E 𝟙(|Z(u)∩Z(v)| > 0) + Σ_(u,v)∉E 𝟙(|Z(u)∩Z(v)| = 0)
+//
+// This counts:
+// - How many edge pairs share ≥1 community (weighted by alpha)
+// - How many non-edge pairs share 0 communities
+func computeF(graph *Graph, Z ZMatrix, alpha float64) float64 {
+	var edgeTerm float64
+
+	// Edge term: iterate over all edges
+	for edge := range graph.Edges {
+		zA := Z[edge.A]
+		zB := Z[edge.B]
+		if hasIntersection(zA, zB) {
+			edgeTerm += 1.0
+		}
+	}
+
+	// Non-edge term optimization:
+	// Non-edges with 0 shared communities = Total non-edges - Non-edges with ≥1 shared community
+	numNodes := len(graph.Nodes)
+	totalPairs := numNodes * (numNodes - 1) / 2
+	totalNonEdges := float64(totalPairs - len(graph.Edges))
+
+	// Build community membership lists
+	commMembers := make(map[int][]int64)
+	for node, communities := range Z {
+		iter := communities.Iterator()
+		for iter.HasNext() {
+			comm := int(iter.Next())
+			commMembers[comm] = append(commMembers[comm], node)
+		}
+	}
+
+	// Count pairs that share ≥1 community
+	pairsSharingComm := make(map[matKey]bool)
+
+	for _, members := range commMembers {
+		// For each pair in this community
+		for i := 0; i < len(members); i++ {
+			for j := i + 1; j < len(members); j++ {
+				a, b := members[i], members[j]
+				if a > b {
+					a, b = b, a
+				}
+				pairsSharingComm[matKey{A: a, B: b}] = true
+			}
+		}
+	}
+
+	// Count how many pairs sharing communities are NON-edges
+	nonEdgesSharingComm := 0.0
+	for pair := range pairsSharingComm {
+		if _, ok := graph.Edges[pair]; ok {
+			nonEdgesSharingComm += 1.0
+		}
+	}
+
+	// Non-edges that DON'T share any community
+	nonEdgeTerm := totalNonEdges - nonEdgesSharingComm
+
+	return alpha*edgeTerm + nonEdgeTerm
+}
+
+// computeFNode calculates the local objective f(u, s) for a single node:
+// f(u, s) = α·Σ_{v∈N(u)} 𝟙(|s∩Z(v)| > 0) + Σ_{v∉N(u)} 𝟙(|s∩Z(v)| = 0)
+//
+// This evaluates how good it is to assign node u to community set s
+// given the current assignments Z of all other nodes.
+func computeFNode(graph *Graph, Z ZMatrix, node int64, s *roaring64.Bitmap, alpha float64) float64 {
+	if s.IsEmpty() {
+		// Empty set: no shared communities with anyone
+		// Edge term = 0 (no overlap with neighbors)
+		// Non-edge term = count of all non-neighbors
+		return float64(len(graph.Nodes) - len(graph.Neighbors[node]) - 1)
+	}
+
+	var edgeTerm, nonEdgeTerm float64
+
+	// Track which nodes we've seen as neighbors
+	neighborSet := make(map[int64]bool)
+
+	// Edge term: check neighbors
+	for _, neighbor := range graph.Neighbors[node] {
+		neighborSet[neighbor.Node] = true
+		if neighbor.Node == node {
+			continue // skip self-loops
+		}
+		zNeighbor := Z[neighbor.Node]
+		if hasIntersection(s, zNeighbor) {
+			edgeTerm += 1.0
+		}
+	}
+
+	// Non-edge term: check non-neighbors
+	for _, otherNode := range graph.Nodes {
+		if otherNode == node {
+			continue
+		}
+		if neighborSet[otherNode] {
+			continue // this is a neighbor, skip
+		}
+		zOther := Z[otherNode]
+		if !hasIntersection(s, zOther) {
+			nonEdgeTerm += 1.0
+		}
+	}
+
+	return alpha*edgeTerm + nonEdgeTerm
+}
+
+// enumerateSubsets generates all subsets of communities with size <= maxSize
+// Returns list of community sets as roaring bitmaps
+func enumerateSubsets(communities []uint64, maxSize int, cb func(bm *roaring64.Bitmap)) {
+	if maxSize > len(communities) {
+		maxSize = len(communities)
+	}
+
+	bm := roaring64.New()
+
+	var permute func(n int, offs int)
+	permute = func(n int, offs int) {
+		cb(bm)
+		if n == 0 {
+			return
+		}
+		for x := offs; x < len(communities); x++ {
+			bm.Add(communities[x])
+			permute(n-1, offs+1)
+			bm.Remove(communities[x])
+		}
+	}
+
+	permute(maxSize, 0)
+}
+
+// sampleSoftmax samples an index from a list of scores using softmax distribution
+// Uses Gumbel-Max trick for efficient one-pass sampling
+func sampleSoftmax(scores []float64) int {
+	if len(scores) == 0 {
+		return -1
+	}
+	if len(scores) == 1 {
+		return 0
+	}
+
+	// Gumbel-Max trick: argmax_i (score_i + Gumbel(0,1))
+	// where Gumbel(0,1) = -log(-log(Uniform(0,1)))
+	maxIdx := 0
+	maxVal := scores[0] - math.Log(-math.Log(rand.Float64()))
+
+	for i := 1; i < len(scores); i++ {
+		gumbel := -math.Log(-math.Log(rand.Float64()))
+		val := scores[i] + gumbel
+		if val > maxVal {
+			maxVal = val
+			maxIdx = i
+		}
+	}
+
+	return maxIdx
+}
+
+// initializeZNeighborhood initializes Z matrix using neighborhood seeding
+// Each community is initialized as the neighborhood of a randomly selected node
+// This is Algorithm 3 lines 2-4 from the SimClusters paper
+func initializeZNeighborhood(graph *Graph, numCommunities int) ZMatrix {
+	Z := make(ZMatrix)
+
+	// Initialize all nodes with empty bitmaps
+	for _, node := range graph.Nodes {
+		Z[node] = roaring64.New()
+	}
+
+	// For each community, pick a random node and assign its neighborhood to that community
+	for commID := 0; commID < numCommunities; commID++ {
+		// Pick random seed node
+		seedNode := graph.Nodes[rand.Intn(len(graph.Nodes))]
+
+		// Assign seed node to this community
+		Z[seedNode].Add(uint64(commID))
+
+		// Assign all neighbors of seed to this community
+		for _, neighbor := range graph.Neighbors[seedNode] {
+			if neighbor.Node != seedNode {
+				Z[neighbor.Node].Add(uint64(commID))
+			}
+		}
+	}
+
+	return Z
+}
+
+// ConcurrentMHSearchOverlapping runs the complete overlapping community detection pipeline
+// using Twitter's F(Z) objective function.
+//
+// Returns: map[node_id] -> map[community_id] -> score
+func ConcurrentMHSearchOverlapping(
+	graph *Graph,
+	numCommunities int,
+	totalIters int,
+	alpha float64,
+	maxCommunitiesPerNode int,
+	epsilon float64,
+	maxNeighborCommunities int,
+) map[int64]map[int]float64 {
+	slog.Info("Starting overlapping community detection with F(Z) objective",
+		"nodes", len(graph.Nodes),
+		"edges", len(graph.Edges),
+		"communities", numCommunities,
+		"alpha", alpha,
+		"maxCommPerNode", maxCommunitiesPerNode,
+		"epsilon", epsilon)
+
+	// Initialize Z using neighborhood seeding
+	Z := initializeZNeighborhood(graph, numCommunities)
+
+	// Compute initial F(Z)
+	initialScore := computeF(graph, Z, alpha)
+	slog.Info("Initialization complete", "F(Z)", initialScore)
+
+	// Run Metropolis-Hastings
+	finalZ := MetropolisHastingsOverlapping(
+		graph,
+		Z,
+		numCommunities,
+		totalIters,
+		alpha,
+		maxCommunitiesPerNode,
+		epsilon,
+		maxNeighborCommunities,
+	)
+
+	// Compute final F(Z)
+	finalScore := computeF(graph, finalZ, alpha)
+	slog.Info("MH optimization complete", "final_F(Z)", finalScore, "improvement", finalScore-initialScore)
+
+	// Convert binary Z to weighted scores
+	// For now, we'll use a simple normalization: score = 1.0 / |Z(u)| for each community
+	// This gives equal weight to all communities a node belongs to
+	result := make(map[int64]map[int]float64)
+	for node, communities := range finalZ {
+		if communities.IsEmpty() {
+			continue // skip nodes with no community assignment
+		}
+		result[node] = make(map[int]float64)
+		cardinality := communities.GetCardinality()
+		weight := 1.0 / float64(cardinality)
+		iter := communities.Iterator()
+		for iter.HasNext() {
+			comm := int(iter.Next())
+			result[node][comm] = weight
+		}
+	}
+
+	// Log statistics
+	totalAssignments := 0
+	for _, comms := range result {
+		totalAssignments += len(comms)
+	}
+	avgCommPerNode := float64(totalAssignments) / float64(len(result))
+	slog.Info("Community assignment statistics",
+		"nodes_with_communities", len(result),
+		"total_assignments", totalAssignments,
+		"avg_communities_per_node", avgCommPerNode)
+
+	return result
 }
 
 func computeModularity(graph *Graph, assignment map[int64]int, numCommunities int) float64 {
@@ -898,7 +1238,7 @@ func computeModularityDelta(
 	return delta
 }
 
-func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]int, numCommunities int, minThresh float64) map[int64]map[int]float64 {
+func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]map[int]float64, numCommunities int, minThresh float64) map[int64]map[int]float64 {
 	var lk sync.Mutex
 	interestedIn := make(map[int64]map[int]float64)
 
@@ -922,9 +1262,12 @@ func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]int, numCommunities 
 			iter := folmap.Iterator()
 			for iter.HasNext() {
 				fol := int64(iter.Next())
-				if community, exists := knownFor[fol]; exists {
-					interests[community] += 1
-					total += 1
+				if communities, exists := knownFor[fol]; exists {
+					// Influencer may be in multiple communities with different scores
+					for comm, score := range communities {
+						interests[comm] += score
+						total += score
+					}
 				}
 			}
 
