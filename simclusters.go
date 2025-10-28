@@ -646,30 +646,38 @@ func MetropolisHastingsOverlapping(
 
 		// Compute statistics once per community
 
+		var rcwg sync.WaitGroup
+		var cslk sync.Mutex
+
 		rciter := allRelevantComms.Iterator()
 		for rciter.HasNext() {
 			comm := rciter.Next()
-			users, ok := Zinvert[comm]
-			if !ok {
-				continue
-			}
-
-			var neighborWeight float64
-			var nonNeighborCount float64
-
-			for user := range users {
-				if nw, isNeighbor := neighborSet[user]; isNeighbor {
-					neighborWeight += nw
-				} else {
-					nonNeighborCount += 1.0
+			rcwg.Go(func() {
+				users, ok := Zinvert[comm]
+				if !ok {
+					return
 				}
-			}
 
-			commStats[comm] = struct {
-				neighborWeight   float64
-				nonNeighborCount float64
-			}{neighborWeight, nonNeighborCount}
+				var neighborWeight float64
+				var nonNeighborCount float64
+
+				for user := range users {
+					if nw, isNeighbor := neighborSet[user]; isNeighbor {
+						neighborWeight += nw
+					} else {
+						nonNeighborCount += 1.0
+					}
+				}
+
+				cslk.Lock()
+				commStats[comm] = struct {
+					neighborWeight   float64
+					nonNeighborCount float64
+				}{neighborWeight, nonNeighborCount}
+				cslk.Unlock()
+			})
 		}
+		rcwg.Wait()
 
 		// Step 6: Compute deltas using cached statistics
 		scores := make([]float64, len(candidateSets))
@@ -841,53 +849,6 @@ func computeF(graph *Graph, Z ZMatrix, alpha float64) float64 {
 
 	// Non-edges that DON'T share any community
 	nonEdgeTerm := totalNonEdges - nonEdgesSharingComm
-
-	return alpha*edgeTerm + nonEdgeTerm
-}
-
-// computeFNode calculates the local objective f(u, s) for a single node:
-// f(u, s) = α·Σ_{v∈N(u)} 𝟙(|s∩Z(v)| > 0) + Σ_{v∉N(u)} 𝟙(|s∩Z(v)| = 0)
-//
-// This evaluates how good it is to assign node u to community set s
-// given the current assignments Z of all other nodes.
-func computeFNode(graph *Graph, Z ZMatrix, node int64, s *roaring64.Bitmap, alpha float64) float64 {
-	if s.IsEmpty() {
-		// Empty set: no shared communities with anyone
-		// Edge term = 0 (no overlap with neighbors)
-		// Non-edge term = count of all non-neighbors
-		return float64(len(graph.Nodes) - len(graph.Neighbors[node]) - 1)
-	}
-
-	var edgeTerm, nonEdgeTerm float64
-
-	// Track which nodes we've seen as neighbors
-	neighborSet := make(map[int64]bool)
-
-	// Edge term: check neighbors
-	for _, neighbor := range graph.Neighbors[node] {
-		neighborSet[neighbor.Node] = true
-		if neighbor.Node == node {
-			continue // skip self-loops
-		}
-		zNeighbor := Z[neighbor.Node]
-		if hasIntersection(s, zNeighbor) {
-			edgeTerm += 1.0
-		}
-	}
-
-	// Non-edge term: check non-neighbors
-	for _, otherNode := range graph.Nodes {
-		if otherNode == node {
-			continue
-		}
-		if neighborSet[otherNode] {
-			continue // this is a neighbor, skip
-		}
-		zOther := Z[otherNode]
-		if !hasIntersection(s, zOther) {
-			nonEdgeTerm += 1.0
-		}
-	}
 
 	return alpha*edgeTerm + nonEdgeTerm
 }
@@ -1124,118 +1085,4 @@ func (sc *SimClusters) GetNumInfluencers() int {
 	defer sc.mu.RUnlock()
 
 	return len(sc.graphIndex.Influencers)
-}
-
-// labelPropagationInit initializes communities using label propagation
-// Each node starts with its own label, then iteratively adopts the most common label among neighbors
-func labelPropagationInit(graph *Graph, numCommunities int, maxIters int) map[int64]int {
-	slog.Info("Starting label propagation", "nodes", len(graph.Nodes), "maxIters", maxIters)
-
-	// Initialize: each node gets its own label (its ID)
-	labels := make(map[int64]int64)
-	for _, node := range graph.Nodes {
-		labels[node] = node
-	}
-
-	// Run label propagation iterations
-	for iter := 0; iter < maxIters; iter++ {
-		changed := 0
-
-		// Randomize order each iteration to break ties
-		nodes := append([]int64{}, graph.Nodes...)
-		rand.Shuffle(len(nodes), func(i, j int) {
-			nodes[i], nodes[j] = nodes[j], nodes[i]
-		})
-
-		// For each node, find most common label among neighbors (weighted by edge weight)
-		for _, node := range nodes {
-			// Count weighted label frequencies among neighbors
-			labelWeights := make(map[int64]float64)
-			for _, neighbor := range graph.Neighbors[node] {
-				neighborLabel := labels[neighbor.Node]
-				labelWeights[neighborLabel] += neighbor.Weight
-			}
-
-			// Find most common label (with highest total weight)
-			var bestLabel int64
-			var bestWeight float64
-			for label, weight := range labelWeights {
-				if weight > bestWeight || (weight == bestWeight && label < bestLabel) {
-					bestWeight = weight
-					bestLabel = label
-				}
-			}
-
-			// Update if changed
-			if bestLabel != labels[node] && bestWeight > 0 {
-				labels[node] = bestLabel
-				changed++
-			}
-		}
-
-		slog.Info("Label propagation iteration", "iter", iter, "changed", changed)
-
-		// Stop if converged
-		if changed == 0 {
-			slog.Info("Label propagation converged", "iter", iter)
-			break
-		}
-	}
-
-	// Compress labels to community IDs 0..numCommunities-1
-	return compressLabels(labels, numCommunities)
-}
-
-// compressLabels maps arbitrary labels to community IDs 0..numCommunities-1
-// Communities are ordered by size (largest first) and truncated to numCommunities
-func compressLabels(labels map[int64]int64, numCommunities int) map[int64]int {
-	// Count label frequencies
-	labelCounts := make(map[int64]int)
-	for _, label := range labels {
-		labelCounts[label]++
-	}
-
-	// Sort labels by frequency (largest first)
-	type labelCount struct {
-		label int64
-		count int
-	}
-	sortedLabels := make([]labelCount, 0, len(labelCounts))
-	for label, count := range labelCounts {
-		sortedLabels = append(sortedLabels, labelCount{label, count})
-	}
-	slices.SortFunc(sortedLabels, func(a, b labelCount) int {
-		if a.count != b.count {
-			return b.count - a.count // Descending by count
-		}
-		if a.label < b.label {
-			return -1
-		}
-		return 1
-	})
-
-	// Map top numCommunities labels to 0..numCommunities-1
-	// Remaining labels get assigned to communities round-robin
-	labelToComm := make(map[int64]int)
-	for i, lc := range sortedLabels {
-		if i < numCommunities {
-			labelToComm[lc.label] = i
-		} else {
-			// Overflow: assign round-robin to existing communities
-			labelToComm[lc.label] = i % numCommunities
-		}
-	}
-
-	// Map all nodes to their community IDs
-	assignment := make(map[int64]int, len(labels))
-	for node, label := range labels {
-		assignment[node] = labelToComm[label]
-	}
-
-	slog.Info("Label compression complete",
-		"unique_labels", len(labelCounts),
-		"communities", numCommunities,
-		"largest_community", sortedLabels[0].count)
-
-	return assignment
 }
