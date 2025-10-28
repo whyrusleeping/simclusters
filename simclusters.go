@@ -176,7 +176,7 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 
 	// Continue with clustering from the checkpoint
 	for k, v := range sc.influencerMatrix {
-		if v < 0.4 {
+		if v < 0.2 {
 			delete(sc.influencerMatrix, k)
 		}
 	}
@@ -274,7 +274,7 @@ func (sc *SimClusters) identifyInfluencers() []int64 {
 
 	slog.Info("Influencer follower threshold", "count", topTenPerc, "99perc", ninetyNinePerc)
 
-	minFollows := 1000
+	minFollows := 1500
 	if topTenPerc < minFollows {
 		topTenPerc = minFollows
 	}
@@ -326,7 +326,7 @@ func (sc *SimClusters) influencerMatrixPrecomputation(influencers []int64) (map[
 			folset := sc.graphIndex.GetFollowers(uidx)
 			folset.RunOptimize()
 			norm := math.Sqrt(float64(folset.GetCardinality()))
-			mh := ComputeMinHash(folset, 128)
+			mh := ComputeMinHash(folset, 200)
 
 			maplk.Lock()
 			norms[uidx] = norm
@@ -371,6 +371,7 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 			normA := norms[uidx]
 			mhA := minhashes[uidx]
 
+			lmatrix := make(map[matKey]float64, len(influencers)-ix)
 			for _, ouid := range influencers[ix+1:] {
 				mhB := minhashes[ouid]
 				mhsim := EstimateSimilarity(mhA, mhB)
@@ -390,13 +391,17 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 					continue
 				}
 
-				ilk.Lock()
-				infMatrix[matKey{
+				lmatrix[matKey{
 					A: uidx,
 					B: ouid,
 				}] = val
-				ilk.Unlock()
 			}
+
+			ilk.Lock()
+			for k, v := range lmatrix {
+				infMatrix[k] = v
+			}
+			ilk.Unlock()
 		}(i, uid)
 	}
 
@@ -430,46 +435,78 @@ type Graph struct {
 	Nodes []int64
 	Edges map[matKey]float64
 
-	Neighbors map[int64][]neighborWeight
+	Neighbors    map[int64][]neighborWeight
+	NeighborSets map[int64]map[int64]float64
 }
 
 func NewGraph(edges map[matKey]float64) *Graph {
 	g := &Graph{
-		Edges:     edges,
-		Neighbors: make(map[int64][]neighborWeight),
+		Edges:        edges,
+		Neighbors:    make(map[int64][]neighborWeight),
+		NeighborSets: make(map[int64]map[int64]float64),
 	}
 	nodeMap := make(map[int64]bool)
 
 	// Extract all nodes
-	for key, val := range edges {
-		nodeMap[key.A] = true
-		nodeMap[key.B] = true
+	var wg sync.WaitGroup
 
-		g.Neighbors[key.A] = append(g.Neighbors[key.A], neighborWeight{
-			Node:   key.B,
-			Weight: val,
-		})
-		g.Neighbors[key.B] = append(g.Neighbors[key.B], neighborWeight{
-			Node:   key.A,
-			Weight: val,
-		})
-	}
+	wg.Go(func() {
+		for key, _ := range edges {
+			nodeMap[key.A] = true
+			nodeMap[key.B] = true
+		}
+	})
+
+	wg.Go(func() {
+		for key, val := range edges {
+			g.Neighbors[key.A] = append(g.Neighbors[key.A], neighborWeight{
+				Node:   key.B,
+				Weight: val,
+			})
+			g.Neighbors[key.B] = append(g.Neighbors[key.B], neighborWeight{
+				Node:   key.A,
+				Weight: val,
+			})
+		}
+	})
+
+	wg.Go(func() {
+		for key, val := range edges {
+			nsa, ok := g.NeighborSets[key.A]
+			if !ok {
+				nsa = make(map[int64]float64)
+				g.NeighborSets[key.A] = nsa
+			}
+			nsa[key.B] = val
+
+			nsb, ok := g.NeighborSets[key.B]
+			if !ok {
+				nsb = make(map[int64]float64)
+				g.NeighborSets[key.B] = nsb
+			}
+			nsb[key.A] = val
+		}
+	})
+
+	wg.Wait()
 
 	for nd := range nodeMap {
 		g.Nodes = append(g.Nodes, nd)
 	}
 
-	for _, v := range g.Neighbors {
-		slices.SortFunc(v, func(a, b neighborWeight) int {
-			if a.Weight > b.Weight {
-				return -1
-			}
-			if a.Weight < b.Weight {
-				return 1
-			}
-			return 0
-		})
-	}
+	/*
+		for _, v := range g.Neighbors {
+			slices.SortFunc(v, func(a, b neighborWeight) int {
+				if a.Weight > b.Weight {
+					return -1
+				}
+				if a.Weight < b.Weight {
+					return 1
+				}
+				return 0
+			})
+		}
+	*/
 
 	return g
 }
@@ -490,124 +527,6 @@ func copyAssignment(a map[int64]int) map[int64]int {
 	return nmap
 }
 
-// Deprecated: Use ConcurrentMHSearchOverlapping instead
-// This old version uses modularity objective and single-community assignment
-func ConcurrentMHSearch_DEPRECATED(graph *Graph, numCommunities, itersPerLoop, totalLoops, concurrency int, useLabelProp bool) map[int64]int {
-	// Log graph statistics
-	numNodes := len(graph.Nodes)
-	numEdges := len(graph.Edges)
-	var totalDegree, totalEdgeWeight, minWeight, maxWeight float64 = 0, 0, math.MaxFloat64, 0
-	for _, neighbors := range graph.Neighbors {
-		for _, n := range neighbors {
-			totalDegree += n.Weight
-		}
-	}
-	for _, weight := range graph.Edges {
-		totalEdgeWeight += weight
-		if weight < minWeight {
-			minWeight = weight
-		}
-		if weight > maxWeight {
-			maxWeight = weight
-		}
-	}
-	avgDegree := totalDegree / float64(numNodes)
-	avgEdgeWeight := totalEdgeWeight / float64(numEdges)
-	density := float64(numEdges) / (float64(numNodes) * float64(numNodes-1) / 2)
-
-	slog.Info("Graph statistics",
-		"nodes", numNodes,
-		"edges", numEdges,
-		"total_edge_weight", totalEdgeWeight,
-		"avg_edge_weight", avgEdgeWeight,
-		"min_edge_weight", minWeight,
-		"max_edge_weight", maxWeight,
-		"avg_degree", avgDegree,
-		"density", density,
-		"target_communities", numCommunities)
-
-	var startingAssignment map[int64]int
-	var modularity float64
-
-	if useLabelProp {
-		slog.Info("Using label propagation for initialization...")
-		startingAssignment = labelPropagationInit(graph, numCommunities, 5) // can increase this more later if we like the results
-		modularity = computeModularity(graph, startingAssignment, numCommunities)
-		validateModularity(modularity, "label_propagation_init")
-		slog.Info("Label propagation initialization complete", "modularity", modularity)
-	} else {
-		// start by generating some number of random starting assignments, and then picking the one with highest modularity
-		slog.Info("doing a search for a decent starting position...")
-		startingAssignment = initializeRandomAssignment(graph, numCommunities)
-		modularity = computeModularity(graph, startingAssignment, numCommunities)
-		mod2 := Modularity2(startingAssignment, graph)
-		//startingAssignment, modularity = initializationSearch(graph, numCommunities, concurrency)
-		validateModularity(modularity, "initialization_search")
-		slog.Info("starting assignment found", "modularity", modularity, "mod2", mod2)
-	}
-
-	degree := make(map[int64]float64)
-	var totalWeight float64
-	for key, weight := range graph.Edges {
-		degree[key.A] += weight
-		degree[key.B] += weight
-		totalWeight += weight
-	}
-
-	// Initialize community degrees
-	communityDegrees := make(map[int]float64)
-	for node, comm := range startingAssignment {
-		communityDegrees[comm] += degree[node]
-	}
-
-	mhpc := &mhPrecomputes{
-		degree:           degree,
-		totalWeight:      totalWeight,
-		communityDegrees: communityDegrees,
-	}
-
-	cur := startingAssignment
-
-	startTemp := float64(4)
-	endTemp := float64(1)
-
-	for i := 0; i < totalLoops; i++ {
-		progress := float64(i) / float64(totalLoops-1)
-		temperature := startTemp * float64(math.Pow(float64(endTemp/startTemp), float64(progress)))
-
-		next, nmod := mhSearchRound(graph, cur, modularity, numCommunities, concurrency, itersPerLoop, temperature, mhpc)
-
-		// Validate by recomputing full modularity
-		//actualMod := computeModularity(graph, next, numCommunities)
-		//drift := actualMod - nmod
-
-		validateModularity(nmod, "mh_search_round_accumulated")
-		//validateModularity(actualMod, "mh_search_round_actual")
-
-		/*
-			if math.Abs(float64(drift)) > 0.001 {
-				slog.Warn("Modularity drift detected", "accumulated", nmod, "actual", actualMod, "drift", drift)
-			}
-		*/
-
-		slog.Info("mh search round complete", "round", i, "modularity", nmod, "delta", nmod-modularity, "temperature", temperature)
-
-		// Use actual recomputed modularity to avoid drift
-		modularity = nmod
-		cur = next
-
-		// Recompute community degrees for the new best assignment
-		for comm := range mhpc.communityDegrees {
-			mhpc.communityDegrees[comm] = 0
-		}
-		for node, comm := range cur {
-			mhpc.communityDegrees[comm] += mhpc.degree[node]
-		}
-	}
-
-	return cur
-}
-
 func copyCommunityDegrees(cd map[int]float64) map[int]float64 {
 	copy := make(map[int]float64, len(cd))
 	for k, v := range cd {
@@ -616,82 +535,9 @@ func copyCommunityDegrees(cd map[int]float64) map[int]float64 {
 	return copy
 }
 
-func mhSearchRound(graph *Graph, assignment map[int64]int, currentScore float64, numCommunities, concurrency, numIters int, temperature float64, pc *mhPrecomputes) (map[int64]int, float64) {
-	var lk sync.Mutex
-	var best map[int64]int = assignment
-	var bestScore float64 = currentScore
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < concurrency; i++ {
-		mcopy := copyAssignment(assignment)
-		// Each worker needs its own copy of communityDegrees since they modify it
-		pcCopy := &mhPrecomputes{
-			degree:           pc.degree, // read-only, can share
-			totalWeight:      pc.totalWeight,
-			communityDegrees: copyCommunityDegrees(pc.communityDegrees),
-		}
-
-		wg.Go(func() {
-			nassign, nmod := MetropolisHastings(graph, mcopy, currentScore, numCommunities, numIters, temperature, pcCopy)
-
-			lk.Lock()
-			if nmod > bestScore {
-				bestScore = nmod
-				best = nassign
-			}
-			lk.Unlock()
-		})
-	}
-
-	wg.Wait()
-
-	return best, bestScore
-}
-
-func initializationSearch(graph *Graph, numCommunities, concurrency int) (map[int64]int, float64) {
-	var lk sync.Mutex
-	var best map[int64]int
-	var bestScore float64
-
-	var wg sync.WaitGroup
-	sema := make(chan struct{}, concurrency)
-
-	for i := 0; i < 1000; i++ {
-		sema <- struct{}{}
-		wg.Go(func() {
-			defer func() {
-				<-sema
-			}()
-
-			assignment := initializeRandomAssignment(graph, numCommunities)
-			mod := computeModularity(graph, assignment, numCommunities)
-
-			lk.Lock()
-			if mod > bestScore {
-				bestScore = mod
-				best = assignment
-			}
-			lk.Unlock()
-		})
-	}
-
-	wg.Wait()
-
-	return best, bestScore
-}
-
-type mhPrecomputes struct {
-	degree           map[int64]float64
-	totalWeight      float64
-	communityDegrees map[int]float64 // K_c for each community
-}
-
-// Deprecated: Old single-community MetropolisHastings (for backward compatibility)
-func MetropolisHastings(graph *Graph, startingAssignment map[int64]int, currentScore float64, numCommunities, maxIters int, temperature float64, pc *mhPrecomputes) (map[int64]int, float64) {
-	// This is a stub for backward compatibility with deprecated code
-	// New code should use MetropolisHastingsOverlapping
-	return startingAssignment, currentScore
+type communityStat struct {
+	neighborWeight   float64
+	nonNeighborCount float64
 }
 
 // MetropolisHastingsOverlapping implements Twitter's Neighborhood-aware MH
@@ -716,10 +562,32 @@ func MetropolisHastingsOverlapping(
 ) ZMatrix {
 	Z := startingZ
 
+	// map from communities to users in them
+	Zinvert := make(map[uint64]map[int64]bool)
+
+	for u, cset := range Z {
+		iter := cset.Iterator()
+		for iter.HasNext() {
+			c := iter.Next()
+			umap, ok := Zinvert[c]
+			if !ok {
+				umap = make(map[int64]bool)
+				Zinvert[c] = umap
+			}
+			umap[u] = true
+		}
+	}
+
 	bar := progressbar.Default(int64(maxIters))
+
+	var deltaGain float64
+
+	var totalCsets int64
+	var averageCsetSize int
 
 	for iter := 0; iter < maxIters; iter++ {
 		bar.Add(1)
+		bar.Describe(fmt.Sprintf("dg: %0.1f, avcss: %d", deltaGain, averageCsetSize))
 		// Pick a random node
 		node := graph.Nodes[rand.Intn(len(graph.Nodes))]
 		oldSet := Z[node]
@@ -728,7 +596,8 @@ func MetropolisHastingsOverlapping(
 		neighbors := graph.Neighbors[node]
 		nsets := make([]*roaring64.Bitmap, 0, len(neighbors))
 		for _, neighbor := range neighbors {
-			nsets = append(nsets, Z[neighbor.Node])
+			comms := Z[neighbor.Node]
+			nsets = append(nsets, comms)
 		}
 
 		neighborCommunities := roaring64.ParOr(2, nsets...)
@@ -744,63 +613,160 @@ func MetropolisHastingsOverlapping(
 		}
 
 		// Step 3: Cap neighborhood communities if too many
-		if int(neighborCommunities.GetCardinality()) > maxNeighborCommunities {
-			// Keep only maxNeighborCommunities random ones
-			commList := make([]uint64, 0, neighborCommunities.GetCardinality())
-			for val := range roaring64.Values(neighborCommunities) {
-				commList = append(commList, val)
-			}
-			rand.Shuffle(len(commList), func(i, j int) {
-				commList[i], commList[j] = commList[j], commList[i]
-			})
-			neighborCommunities.Clear()
-			for i := 0; i < maxNeighborCommunities; i++ {
-				neighborCommunities.Add(commList[i])
-			}
-		}
+		neighborCommunities = limitNeighborhood(neighborCommunities, maxNeighborCommunities)
 
 		if neighborCommunities.IsEmpty() {
 			continue // isolated node, skip
 		}
 
 		// Step 4: Enumerate all subsets up to size maxCommunitiesPerNode
-		commList := make([]uint64, 0, neighborCommunities.GetCardinality())
-		iter := neighborCommunities.Iterator()
-		for iter.HasNext() {
-			commList = append(commList, iter.Next())
-		}
+		commList := neighborCommunities.ToArray()
 
-		candidateSets := make([]*roaring64.Bitmap, 0, 50)
+		candidateSets := make([]*roaring64.Bitmap, 0, 16)
 		enumerateSubsets(commList, maxCommunitiesPerNode, func(bm *roaring64.Bitmap) {
 			candidateSets = append(candidateSets, bm.Clone())
 		})
 
-		// Step 5: Compute f(u, s) for each candidate subset
-		scores := make([]float64, len(candidateSets))
-		for i, candidateSet := range candidateSets {
-			scores[i] = computeFNode(graph, Z, node, candidateSet, alpha)
+		totalCsets += int64(len(candidateSets))
+		averageCsetSize = int(totalCsets) / int(iter+1)
+
+		// Step 5: Precompute per-community statistics ONCE, reuse for all candidates
+		// This avoids iterating through Zinv[comm] users multiple times
+		neighborSet := graph.NeighborSets[node]
+		nonEdgeScore := 1.0 / alpha
+
+		// Cache: for each community, store (neighbor_weight_sum, non_neighbor_count)
+		commStats := make(map[uint64]communityStat)
+
+		// Build union of all communities we'll need (from oldSet and all candidates)
+		allRelevantComms := oldSet.Clone()
+		for _, cset := range candidateSets {
+			allRelevantComms.Or(cset)
 		}
 
-		// Step 6: Sample a subset via softmax (using Gumbel-Max trick)
+		// Compute statistics once per community
+
+		rciter := allRelevantComms.Iterator()
+		for rciter.HasNext() {
+			comm := rciter.Next()
+			users, ok := Zinvert[comm]
+			if !ok {
+				continue
+			}
+
+			var neighborWeight float64
+			var nonNeighborCount float64
+
+			for user := range users {
+				if nw, isNeighbor := neighborSet[user]; isNeighbor {
+					neighborWeight += nw
+				} else {
+					nonNeighborCount += 1.0
+				}
+			}
+
+			commStats[comm] = struct {
+				neighborWeight   float64
+				nonNeighborCount float64
+			}{neighborWeight, nonNeighborCount}
+		}
+
+		// Step 6: Compute deltas using cached statistics
+		scores := make([]float64, len(candidateSets))
+		for i, candidateSet := range candidateSets {
+			var delta float64
+
+			// Communities we're leaving
+			oiter := oldSet.Iterator()
+			for oiter.HasNext() {
+				oc := oiter.Next()
+				if !candidateSet.Contains(oc) {
+					stats := commStats[oc]
+					delta -= stats.neighborWeight
+					delta += stats.nonNeighborCount * nonEdgeScore
+				}
+			}
+
+			// Communities we're joining
+			niter := candidateSet.Iterator()
+			for niter.HasNext() {
+				nc := niter.Next()
+				if !oldSet.Contains(nc) {
+					stats := commStats[nc]
+					delta += stats.neighborWeight
+					delta -= stats.nonNeighborCount * nonEdgeScore
+				}
+			}
+
+			scores[i] = delta
+		}
+
+		// Step 7: Sample a subset via softmax (using Gumbel-Max trick)
 		selectedIdx := sampleSoftmax(scores)
 		newSet := candidateSets[selectedIdx]
 
-		// Step 7: Metropolis-Hastings acceptance
+		// Step 8: Metropolis-Hastings acceptance
 		// Compute change in objective
-		oldScore := computeFNode(graph, Z, node, oldSet, alpha)
-		newScore := scores[selectedIdx]
-		delta := newScore - oldScore
+		delta := scores[selectedIdx]
 
 		// Accept with probability min(1, e^delta)
 		acceptProb := math.Min(1.0, math.Exp(delta))
 		if rand.Float64() < acceptProb {
 			// Accept: update Z[node]
 			Z[node] = newSet
+			updateZinv(Zinvert, node, oldSet, newSet)
+			deltaGain += delta
 		}
 		// If rejected, Z[node] stays the same
 	}
 
 	return Z
+}
+
+func limitNeighborhood(neighborCommunities *roaring64.Bitmap, maxNeighborCommunities int) *roaring64.Bitmap {
+	if int(neighborCommunities.GetCardinality()) > maxNeighborCommunities {
+		// Keep only maxNeighborCommunities random ones
+		commList := make([]uint64, 0, neighborCommunities.GetCardinality())
+		for val := range roaring64.Values(neighborCommunities) {
+			commList = append(commList, val)
+		}
+		rand.Shuffle(len(commList), func(i, j int) {
+			commList[i], commList[j] = commList[j], commList[i]
+		})
+		neighborCommunities.Clear()
+		for i := 0; i < maxNeighborCommunities; i++ {
+			neighborCommunities.Add(commList[i])
+		}
+	}
+	return neighborCommunities
+}
+
+func updateZinv(Zinvert map[uint64]map[int64]bool, node int64, oldSet, newSet *roaring64.Bitmap) {
+	// Update Zinvert: remove node from old communities, add to new ones
+	// Remove from old communities
+	iter := oldSet.Iterator()
+	for iter.HasNext() {
+		oldComm := iter.Next()
+		if !newSet.Contains(oldComm) {
+			// This community is being left
+			if users, ok := Zinvert[oldComm]; ok {
+				delete(users, node)
+			}
+		}
+	}
+
+	// Add to new communities
+	newIter := newSet.Iterator()
+	for newIter.HasNext() {
+		newComm := newIter.Next()
+		if !oldSet.Contains(newComm) {
+			// This community is being joined
+			if _, ok := Zinvert[newComm]; !ok {
+				Zinvert[newComm] = make(map[int64]bool)
+			}
+			Zinvert[newComm][node] = true
+		}
+	}
 }
 
 // ============================================================================
@@ -943,7 +909,7 @@ func enumerateSubsets(communities []uint64, maxSize int, cb func(bm *roaring64.B
 		}
 		for x := offs; x < len(communities); x++ {
 			bm.Add(communities[x])
-			permute(n-1, offs+1)
+			permute(n-1, x+1)
 			bm.Remove(communities[x])
 		}
 	}
@@ -1033,8 +999,9 @@ func ConcurrentMHSearchOverlapping(
 	Z := initializeZNeighborhood(graph, numCommunities)
 
 	// Compute initial F(Z)
-	initialScore := computeF(graph, Z, alpha)
-	slog.Info("Initialization complete", "F(Z)", initialScore)
+	//initialScore := computeF(graph, Z, alpha)
+	//slog.Info("Initialization complete", "F(Z)", initialScore)
+	initialScore := -1.0
 
 	// Run Metropolis-Hastings
 	finalZ := MetropolisHastingsOverlapping(
@@ -1049,7 +1016,8 @@ func ConcurrentMHSearchOverlapping(
 	)
 
 	// Compute final F(Z)
-	finalScore := computeF(graph, finalZ, alpha)
+	//finalScore := computeF(graph, finalZ, alpha)
+	finalScore := -1.0
 	slog.Info("MH optimization complete", "final_F(Z)", finalScore, "improvement", finalScore-initialScore)
 
 	// Convert binary Z to weighted scores
@@ -1082,160 +1050,6 @@ func ConcurrentMHSearchOverlapping(
 		"avg_communities_per_node", avgCommPerNode)
 
 	return result
-}
-
-func computeModularity(graph *Graph, assignment map[int64]int, numCommunities int) float64 {
-	// Use community-aggregated formula: Q = Σ_c [ L_c/(2m) - (K_c/(2m))² ]
-	// This is O(edges + nodes) instead of O(nodes²)
-
-	// Compute node degrees
-	// Use float64 for accumulation to avoid precision loss with large graphs
-	var totalWeight float64
-	degree := make(map[int64]float64)
-
-	// Populate degree map and calculate total weight
-	for key, weight := range graph.Edges {
-		totalWeight += weight
-		degree[key.A] += weight
-		degree[key.B] += weight
-	}
-
-	if totalWeight == 0 {
-		return 0
-	}
-
-	// Compute L_c (sum of edge weights within community c)
-	edgesWithin := make(map[int]float64)
-	for key, weight := range graph.Edges {
-		if assignment[key.A] == assignment[key.B] {
-			edgesWithin[assignment[key.A]] += weight
-		}
-	}
-
-	// Compute K_c (sum of degrees in community c)
-	totalDegree := make(map[int]float64)
-	for node, comm := range assignment {
-		totalDegree[comm] += degree[node]
-	}
-
-	// Compute modularity: Q = Σ_c [ L_c/(2m) - (K_c/(2m))² ]
-	// Note: m is the sum of edge weights (each edge counted once)
-	// K_c is the sum of degrees, so sum of all K_c = 2m
-	var modularity float64
-	twoM := 2 * totalWeight
-	for comm := range totalDegree {
-		Lc := edgesWithin[comm]
-		Kc := totalDegree[comm]
-		modularity += float64(float64(Lc)/twoM - (float64(Kc)/twoM)*(float64(Kc)/twoM))
-	}
-
-	return modularity
-}
-
-func Modularity2(communities map[int64]int, graph *Graph) float64 {
-	if len(graph.Edges) == 0 {
-		return 0.0
-	}
-
-	// Calculate total weight of all edges (2m in the formula)
-	var totalWeight float64
-	for _, weight := range graph.Edges {
-		totalWeight += weight
-	}
-
-	// Calculate degree (strength) of each node
-	degrees := make(map[int64]float64)
-	for edge, weight := range graph.Edges {
-		degrees[edge.A] += weight
-		degrees[edge.B] += weight
-	}
-
-	// Calculate modularity Q
-	var q float64
-	for edge, weight := range graph.Edges {
-		// Check if both nodes are in the same community
-		commA, okA := communities[edge.A]
-		commB, okB := communities[edge.B]
-
-		if !okA || !okB {
-			// Skip edges where nodes don't have community assignments
-			continue
-		}
-
-		if commA != commB {
-			continue
-		}
-
-		// Q = 1/(2m) * Σ[A_ij - (k_i * k_j)/(2m)] * δ(c_i, c_j)
-		// where A_ij is the weight of edge (i,j)
-		// k_i and k_j are the sum of weights of edges attached to nodes i and j
-		// δ(c_i, c_j) = 1 if i and j are in the same community, 0 otherwise
-		expectedWeight := (degrees[edge.A] * degrees[edge.B]) / totalWeight
-
-		q += (weight - expectedWeight)
-	}
-
-	// Normalize by total weight
-	q /= totalWeight
-
-	return q
-}
-
-func validateModularity(modularity float64, context string) {
-	if modularity < -1.0 || modularity > 1.0 {
-		slog.Warn("Modularity out of expected range [-1, 1]",
-			"context", context,
-			"modularity", modularity)
-	}
-	if modularity < -0.5 {
-		slog.Warn("Very low modularity suggests poor community structure",
-			"context", context,
-			"modularity", modularity)
-	}
-}
-
-func computeModularityDelta(
-	graph *Graph,
-	assignment map[int64]int,
-	node int64,
-	oldCommunity, newCommunity int,
-	pc *mhPrecomputes,
-) float64 {
-	if pc.totalWeight == 0 {
-		return 0
-	}
-
-	// Delta formula for moving node v from c_old to c_new:
-	// ΔQ = (dLnew - dLold)/(2m) + 2*k*(Kold - Knew - k)/(2m)²
-	// where:
-	//   dLold = edges from v to nodes in old community
-	//   dLnew = edges from v to nodes in new community
-	//   k = degree of node v
-	//   Kold = total degree of old community (includes k)
-	//   Knew = total degree of new community (doesn't include k)
-	//   m = sum of all edge weights
-
-	k := pc.degree[node]
-	Kold := pc.communityDegrees[oldCommunity]
-	Knew := pc.communityDegrees[newCommunity]
-
-	// Compute dLold and dLnew (edge weight changes)
-	var dLold, dLnew float64
-	for _, neighbor := range graph.Neighbors[node] {
-		neighborComm := assignment[neighbor.Node]
-		if neighborComm == oldCommunity { // && neighbor.Node != node { // this extra condition should be impossible
-			dLold += neighbor.Weight
-		}
-		if neighborComm == newCommunity {
-			dLnew += neighbor.Weight
-		}
-	}
-
-	// Apply corrected formula with factor of 2 on K² term
-	twoM := 2 * pc.totalWeight
-	delta := (dLnew-dLold)/twoM + 2*k*(Kold-Knew-k)/(twoM*twoM)
-
-	return delta
 }
 
 func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]map[int]float64, numCommunities int, minThresh float64) map[int64]map[int]float64 {

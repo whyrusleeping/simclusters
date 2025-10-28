@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -148,7 +150,7 @@ func runClustering(ctx context.Context, cmd *cli.Command) error {
 
 	bar := progressbar.Default(int64(len(files)))
 	var wg sync.WaitGroup
-	sema := make(chan struct{}, 30)
+	sema := make(chan struct{}, 40)
 	for _, fn := range files {
 		wg.Add(1)
 		sema <- struct{}{}
@@ -207,7 +209,7 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 	}
 	defer mf.Close()
 
-	var userMappings map[int64]map[int]float64
+	var userMappings map[int64]map[int64]float64
 	if err := json.NewDecoder(mf).Decode(&userMappings); err != nil {
 		return fmt.Errorf("failed to decode mapping.json: %w", err)
 	}
@@ -222,7 +224,7 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 	}
 	defer inf.Close()
 
-	var influencerCommunities map[int64]int
+	var influencerCommunities map[int64]map[int64]float64
 	if err := json.NewDecoder(inf).Decode(&influencerCommunities); err != nil {
 		return fmt.Errorf("failed to decode influencer_communities.json: %w", err)
 	}
@@ -230,9 +232,11 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 	fmt.Printf("Loaded %d influencer->community mappings\n", len(influencerCommunities))
 
 	// Build reverse index: community -> list of influencers
-	commToInfluencers := make(map[int][]int64)
-	for nodeID, commID := range influencerCommunities {
-		commToInfluencers[commID] = append(commToInfluencers[commID], nodeID)
+	commToInfluencers := make(map[int64][]int64)
+	for nodeID, commSet := range influencerCommunities {
+		for commID, _ := range commSet {
+			commToInfluencers[commID] = append(commToInfluencers[commID], nodeID)
+		}
 	}
 
 	// Sort each community's influencer list for consistent ordering
@@ -242,6 +246,13 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 
 	fmt.Printf("Found %d unique communities\n", len(commToInfluencers))
 	fmt.Printf("Found %d users\n", len(userMappings))
+
+	mat, err := loadMatrixBin("checkpoint-big3/matrix.bin")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Loaded %d edges\n", len(mat))
+
 	fmt.Println("\nEnter DIDs or handles to query (or 'quit' to exit):")
 
 	// Interactive REPL
@@ -307,7 +318,9 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 				fmt.Printf("User %d not found in mappings\n", nodeID)
 				continue
 			}
-			userComms = map[int]float64{infcom: 1}
+			for commID, weight := range infcom {
+				userComms = map[int64]float64{commID: weight}
+			}
 		}
 
 		fmt.Printf("\nUser: %d (%s)\n", nodeID, did)
@@ -315,7 +328,7 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 
 		// Sort communities by score (descending)
 		type commScore struct {
-			commID int
+			commID int64
 			score  float64
 		}
 		var sortedComms []commScore
@@ -329,7 +342,7 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 				}
 				return 1
 			}
-			return a.commID - b.commID
+			return int(a.commID - b.commID)
 		})
 
 		// Show each community and its top influencers
@@ -373,6 +386,13 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 			}
 			fmt.Println()
 		}
+
+		fmt.Println("Influencer edges for user")
+		for k, v := range mat {
+			if k.A == nodeID || k.B == nodeID {
+				fmt.Printf("%d -> %d: %f\n", k.A, k.B, v)
+			}
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -381,4 +401,49 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 
 	fmt.Println("Goodbye!")
 	return nil
+}
+
+type matKey struct {
+	A, B int64
+}
+
+func loadMatrixBin(path string) (map[matKey]float64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 256*1024)
+
+	// Read count
+	var count int64
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, fmt.Errorf("failed to read count: %w", err)
+	}
+
+	// Read matrix entries
+	matrix := make(map[matKey]float64, count)
+	buf := make([]byte, 24)
+	for i := int64(0); i < count; i++ {
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+
+		var a, b int64
+		var val float64
+
+		a = int64(binary.LittleEndian.Uint64(buf[:8]))
+		b = int64(binary.LittleEndian.Uint64(buf[8:16]))
+		valb := binary.LittleEndian.Uint64(buf[16:])
+		val = math.Float64frombits(valb)
+
+		matrix[matKey{A: a, B: b}] = val
+
+		if (i+1)%int64(10000) == 0 {
+			slog.Debug("Matrix load progress", "loaded", i+1, "total", count)
+		}
+	}
+
+	return matrix, nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -516,7 +517,6 @@ func saveMatrix(path string, matrix map[matKey]float64) error {
 	return w.Flush()
 }
 
-// loadMatrixBin loads the influencer matrix from binary format
 func loadMatrixBin(path string) (map[matKey]float64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -534,23 +534,23 @@ func loadMatrixBin(path string) (map[matKey]float64, error) {
 
 	// Read matrix entries
 	matrix := make(map[matKey]float64, count)
+	buf := make([]byte, 24)
 	for i := int64(0); i < count; i++ {
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+
 		var a, b int64
 		var val float64
 
-		if err := binary.Read(r, binary.LittleEndian, &a); err != nil {
-			return nil, fmt.Errorf("failed to read key.A: %w", err)
-		}
-		if err := binary.Read(r, binary.LittleEndian, &b); err != nil {
-			return nil, fmt.Errorf("failed to read key.B: %w", err)
-		}
-		if err := binary.Read(r, binary.LittleEndian, &val); err != nil {
-			return nil, fmt.Errorf("failed to read value: %w", err)
-		}
+		a = int64(binary.LittleEndian.Uint64(buf[:8]))
+		b = int64(binary.LittleEndian.Uint64(buf[8:16]))
+		valb := binary.LittleEndian.Uint64(buf[16:])
+		val = math.Float64frombits(valb)
 
 		matrix[matKey{A: a, B: b}] = val
 
-		if (i+1)%int64(progressFreq) == 0 {
+		if (i+1)%int64(10000) == 0 {
 			slog.Debug("Matrix load progress", "loaded", i+1, "total", count)
 		}
 	}
