@@ -74,6 +74,49 @@ func main() {
 				},
 				Action: runQuery,
 			},
+			{
+				Name:  "debug-users",
+				Usage: "Debug missing high-follower users in the output",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "checkpoint",
+						Aliases: []string{"c"},
+						Usage:   "Path to checkpoint directory",
+						Value:   "checkpoint-big5",
+					},
+					&cli.StringSliceFlag{
+						Name:    "users",
+						Aliases: []string{"u"},
+						Usage:   "User IDs to debug (can specify multiple)",
+					},
+				},
+				Action: runDebugUsers,
+			},
+			{
+				Name:  "export-csv",
+				Usage: "Export community mappings to CSV with DIDs",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:    "mapping",
+						Aliases: []string{"m"},
+						Usage:   "Path to mapping.json (user->community mappings)",
+						Value:   "mapping.json",
+					},
+					&cli.StringFlag{
+						Name:    "influencers",
+						Aliases: []string{"i"},
+						Usage:   "Path to influencer_communities.json",
+						Value:   "influencer_communities.json",
+					},
+					&cli.StringFlag{
+						Name:    "output",
+						Aliases: []string{"o"},
+						Usage:   "Output CSV file path",
+						Value:   "communities.csv",
+					},
+				},
+				Action: runExportCSV,
+			},
 		},
 	}
 
@@ -247,11 +290,13 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 	fmt.Printf("Found %d unique communities\n", len(commToInfluencers))
 	fmt.Printf("Found %d users\n", len(userMappings))
 
-	mat, err := loadMatrixBin("checkpoint-big3/matrix.bin")
-	if err != nil {
-		return err
-	}
-	fmt.Printf("Loaded %d edges\n", len(mat))
+	/*
+		mat, err := loadMatrixBin("checkpoint-big5/matrix.bin")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Loaded %d edges\n", len(mat))
+	*/
 
 	fmt.Println("\nEnter DIDs or handles to query (or 'quit' to exit):")
 
@@ -313,43 +358,22 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 		// Look up user's communities
 		userComms, found := userMappings[nodeID]
 		if !found {
-			infcom, ok := influencerCommunities[nodeID]
-			if !ok {
-				fmt.Printf("User %d not found in mappings\n", nodeID)
-				continue
-			}
-			for commID, weight := range infcom {
-				userComms = map[int64]float64{commID: weight}
-			}
+			fmt.Printf("User %d not found in user mappings\n", nodeID)
+			userComms = make(map[int64]float64)
+		}
+
+		infcom, ok := influencerCommunities[nodeID]
+		if !ok {
+			fmt.Printf("User %d not found in influencer mappings\n", nodeID)
+			infcom = make(map[int64]float64)
 		}
 
 		fmt.Printf("\nUser: %d (%s)\n", nodeID, did)
-		fmt.Printf("Interested in %d communities:\n\n", len(userComms))
+		fmt.Printf("Interested in %d communities:\n", len(userComms))
 
-		// Sort communities by score (descending)
-		type commScore struct {
-			commID int64
-			score  float64
-		}
-		var sortedComms []commScore
-		for commID, score := range userComms {
-			sortedComms = append(sortedComms, commScore{commID, score})
-		}
-		slices.SortFunc(sortedComms, func(a, b commScore) int {
-			if a.score != b.score {
-				if a.score > b.score {
-					return -1
-				}
-				return 1
-			}
-			return int(a.commID - b.commID)
-		})
-
-		// Show each community and its top influencers
-		for _, cs := range sortedComms {
-			influencers := commToInfluencers[cs.commID]
-			fmt.Printf("Community %d (score: %.3f, %d influencers)\n", cs.commID, cs.score, len(influencers))
-
+		printCommunity := func(commID int64, score float64) {
+			influencers := commToInfluencers[commID]
+			fmt.Printf("Community %d (score: %.3f, %d influencers)\n", commID, score, len(influencers))
 			// Show top 10 influencers with their handles
 			fmt.Println("  Top influencers:")
 			count := 0
@@ -385,14 +409,26 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 				fmt.Println("    (no influencers)")
 			}
 			fmt.Println()
+
 		}
 
-		fmt.Println("Influencer edges for user")
-		for k, v := range mat {
-			if k.A == nodeID || k.B == nodeID {
-				fmt.Printf("%d -> %d: %f\n", k.A, k.B, v)
-			}
+		// Show each community and its top influencers
+		for commID, score := range userComms {
+			printCommunity(commID, score)
 		}
+		fmt.Printf("Influencer in %d communities:\n\n", len(infcom))
+		for commID, score := range infcom {
+			printCommunity(commID, score)
+		}
+
+		/*
+			fmt.Println("Influencer edges for user")
+			for k, v := range mat {
+				if k.A == nodeID || k.B == nodeID {
+					fmt.Printf("%d -> %d: %f\n", k.A, k.B, v)
+				}
+			}
+		*/
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -446,4 +482,272 @@ func loadMatrixBin(path string) (map[matKey]float64, error) {
 	}
 
 	return matrix, nil
+}
+
+func runDebugUsers(ctx context.Context, cmd *cli.Command) error {
+	checkpointPath := cmd.String("checkpoint")
+	userIDs := cmd.StringSlice("users")
+
+	if len(userIDs) == 0 {
+		return fmt.Errorf("no user IDs specified (use -u or --users)")
+	}
+
+	// Parse user IDs
+	var missingUsers []int64
+	for _, userStr := range userIDs {
+		userID, err := strconv.ParseInt(userStr, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid user ID %q: %w", userStr, err)
+		}
+		missingUsers = append(missingUsers, userID)
+	}
+
+	// Load checkpoint
+	fmt.Printf("Loading checkpoint from %s...\n", checkpointPath)
+	state, err := simclusters.LoadCheckpoint(checkpointPath)
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoint: %w", err)
+	}
+
+	fmt.Printf("Loaded checkpoint with %d influencers, %d edges\n",
+		len(state.Influencers), len(state.InfluencerMatrix))
+
+	// Check if they're influencers
+	influencerSet := make(map[int64]bool)
+	for _, id := range state.Influencers {
+		influencerSet[id] = true
+	}
+
+	fmt.Println("\n=== Checking Missing Users ===")
+	for _, userID := range missingUsers {
+		fmt.Printf("\nUser %d:\n", userID)
+
+		// Check if in influencer list
+		if !influencerSet[userID] {
+			fmt.Printf("  ❌ NOT in influencer list\n")
+			continue
+		}
+		fmt.Printf("  ✓ In influencer list\n")
+
+		// Check follower count
+		if user := state.GraphIndex.Users[userID]; user != nil {
+			fmt.Printf("  Followers: %d\n", user.FollowerCount)
+		}
+
+		// Check edge count at different thresholds
+		edgeCount := 0
+		edgesAbove01 := 0
+		edgesAbove015 := 0
+		edgesAbove02 := 0
+		var minSim, maxSim float64 = 1.0, 0.0
+		var sumSim float64
+
+		for edge, weight := range state.InfluencerMatrix {
+			if edge.A == userID || edge.B == userID {
+				edgeCount++
+				sumSim += weight
+				if weight < minSim {
+					minSim = weight
+				}
+				if weight > maxSim {
+					maxSim = weight
+				}
+				if weight >= 0.1 {
+					edgesAbove01++
+				}
+				if weight >= 0.15 {
+					edgesAbove015++
+				}
+				if weight >= 0.2 {
+					edgesAbove02++
+				}
+			}
+		}
+
+		fmt.Printf("  Total edges in checkpoint: %d\n", edgeCount)
+		if edgeCount > 0 {
+			fmt.Printf("  Edges >= 0.10: %d (%.1f%%)\n", edgesAbove01, 100.0*float64(edgesAbove01)/float64(edgeCount))
+			fmt.Printf("  Edges >= 0.15: %d (%.1f%%)\n", edgesAbove015, 100.0*float64(edgesAbove015)/float64(edgeCount))
+			fmt.Printf("  Edges >= 0.20: %d (%.1f%%)\n", edgesAbove02, 100.0*float64(edgesAbove02)/float64(edgeCount))
+			fmt.Printf("  Similarity range: %.4f - %.4f (avg: %.4f)\n", minSim, maxSim, sumSim/float64(edgeCount))
+		}
+
+		// Check if in final output files
+		outputData, err := os.ReadFile("influencer_communities.json")
+		if err != nil {
+			fmt.Printf("  ⚠ Could not read influencer_communities.json: %v\n", err)
+		} else {
+			var communities map[string]map[string]float64
+			if err := json.Unmarshal(outputData, &communities); err != nil {
+				fmt.Printf("  ⚠ Could not parse influencer_communities.json: %v\n", err)
+			} else {
+				userKey := fmt.Sprintf("%d", userID)
+				if comms, exists := communities[userKey]; exists {
+					fmt.Printf("  ✓ In influencer_communities.json with %d communities\n", len(comms))
+				} else {
+					fmt.Printf("  ❌ NOT in influencer_communities.json\n")
+				}
+			}
+		}
+
+		// Check mapping.json
+		mappingData, err := os.ReadFile("mapping.json")
+		if err != nil {
+			fmt.Printf("  ⚠ Could not read mapping.json: %v\n", err)
+		} else {
+			var mapping map[string]map[string]float64
+			if err := json.Unmarshal(mappingData, &mapping); err != nil {
+				fmt.Printf("  ⚠ Could not parse mapping.json: %v\n", err)
+			} else {
+				userKey := fmt.Sprintf("%d", userID)
+				if comms, exists := mapping[userKey]; exists {
+					fmt.Printf("  ✓ In mapping.json with %d communities\n", len(comms))
+				} else {
+					fmt.Printf("  ❌ NOT in mapping.json\n")
+				}
+			}
+		}
+	}
+
+	fmt.Println("\n=== Analysis Summary ===")
+	fmt.Println("If users have edges in checkpoint but not in output:")
+	fmt.Println("  1. Check if edges were filtered by 0.2 threshold (see edges >= 0.20)")
+	fmt.Println("  2. Check if user ended with 0 communities after MH optimization")
+	fmt.Println("  3. Check if user was isolated in graph after filtering")
+
+	return nil
+}
+
+func runExportCSV(ctx context.Context, cmd *cli.Command) error {
+	mappingPath := cmd.String("mapping")
+	influencersPath := cmd.String("influencers")
+	outputPath := cmd.String("output")
+
+	// Connect to database
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		return fmt.Errorf("DATABASE_URL environment variable not set")
+	}
+
+	fmt.Println("Connecting to database...")
+	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Load ALL DID<>UID mappings upfront
+	fmt.Println("Loading all DID<>UID mappings from database...")
+	var repos []Repo
+	if err := db.Table("repos").Select("id, did").Find(&repos).Error; err != nil {
+		return fmt.Errorf("failed to load repos: %w", err)
+	}
+
+	uidToDID := make(map[int64]string)
+	for _, repo := range repos {
+		uidToDID[repo.ID] = repo.DID
+	}
+	fmt.Printf("Loaded %d DID mappings\n", len(uidToDID))
+
+	// Load influencer communities
+	fmt.Printf("Loading influencer communities from %s...\n", influencersPath)
+	inf, err := os.Open(influencersPath)
+	if err != nil {
+		return fmt.Errorf("failed to open influencer file: %w", err)
+	}
+	defer inf.Close()
+
+	var influencerCommunities map[int64]map[int64]float64
+	if err := json.NewDecoder(inf).Decode(&influencerCommunities); err != nil {
+		return fmt.Errorf("failed to decode influencer_communities.json: %w", err)
+	}
+	fmt.Printf("Loaded %d influencer->community mappings\n", len(influencerCommunities))
+
+	// Load user->community mappings
+	fmt.Printf("Loading user mappings from %s...\n", mappingPath)
+	mf, err := os.Open(mappingPath)
+	if err != nil {
+		return fmt.Errorf("failed to open mapping file: %w", err)
+	}
+	defer mf.Close()
+
+	var userMappings map[int64]map[int64]float64
+	if err := json.NewDecoder(mf).Decode(&userMappings); err != nil {
+		return fmt.Errorf("failed to decode mapping.json: %w", err)
+	}
+	fmt.Printf("Loaded %d user->community mappings\n", len(userMappings))
+
+	// Create output CSV
+	fmt.Printf("Writing CSV to %s...\n", outputPath)
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outFile.Close()
+
+	writer := csv.NewWriter(outFile)
+	defer writer.Flush()
+
+	// Write header
+	if err := writer.Write([]string{"DID", "communityID", "is_influencer", "score"}); err != nil {
+		return fmt.Errorf("failed to write CSV header: %w", err)
+	}
+
+	// Track statistics
+	var totalRows, missingDIDs int
+
+	// Write influencer rows
+	for uid, communities := range influencerCommunities {
+		did, hasDID := uidToDID[uid]
+		if !hasDID {
+			missingDIDs++
+			continue // Skip users without DIDs
+		}
+
+		for commID, score := range communities {
+			row := []string{
+				did,
+				fmt.Sprintf("%d", commID),
+				"true",
+				fmt.Sprintf("%.6f", score),
+			}
+			if err := writer.Write(row); err != nil {
+				return fmt.Errorf("failed to write CSV row: %w", err)
+			}
+			totalRows++
+		}
+	}
+
+	// Write regular user rows
+	for uid, communities := range userMappings {
+		did, hasDID := uidToDID[uid]
+		if !hasDID {
+			missingDIDs++
+			continue // Skip users without DIDs
+		}
+
+		for commID, score := range communities {
+			row := []string{
+				did,
+				fmt.Sprintf("%d", commID),
+				"false",
+				fmt.Sprintf("%.6f", score),
+			}
+			if err := writer.Write(row); err != nil {
+				return fmt.Errorf("failed to write CSV row: %w", err)
+			}
+			totalRows++
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("failed to flush CSV: %w", err)
+	}
+
+	fmt.Printf("\n✓ Export complete!\n")
+	fmt.Printf("  Total rows written: %d\n", totalRows)
+	fmt.Printf("  Users without DIDs: %d\n", missingDIDs)
+	fmt.Printf("  Output file: %s\n", outputPath)
+
+	return nil
 }

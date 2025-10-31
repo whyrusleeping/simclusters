@@ -51,6 +51,13 @@ func (sc *SimClusters) IngestEdges(edges []Edge) {
 	sc.graphIndex.AddEdgesBatch(edges) // not using this for now because it uses too much extra memory
 }
 
+const (
+	alpha                  = 10.0 // weight for edge coverage vs non-edge separation
+	maxCommPerNode         = 4    // l parameter - max communities per influencer
+	epsilon                = 0.08 // random exploration probability
+	maxNeighborCommunities = 7    // cap on neighborhood size for enumeration
+)
+
 // ComputeClusters performs the full clustering computation
 func (sc *SimClusters) ComputeClusters() error {
 	sc.mu.Lock()
@@ -89,17 +96,12 @@ func (sc *SimClusters) ComputeClusters() error {
 		"density", fmt.Sprintf("%.6f", density))
 
 	// Twitter SimClusters parameters (from KDD 2020 paper)
-	const (
-		alpha                  = 10.0 // weight for edge coverage vs non-edge separation
-		maxCommPerNode         = 4    // l parameter - max communities per influencer
-		epsilon                = 0.05 // random exploration probability
-		maxNeighborCommunities = 4    // cap on neighborhood size for enumeration
-	)
 
 	influencerCommunities := ConcurrentMHSearchOverlapping(
 		g,
-		10_000,                 // numCommunities
-		1_000_000,              // totalIters (1M iterations total)
+		15_000,                 // numCommunities
+		200_000,                // iters per loop
+		15,                     // total loops
 		alpha,                  // alpha parameter
 		maxCommPerNode,         // max communities per node
 		epsilon,                // random exploration rate
@@ -130,7 +132,7 @@ func (sc *SimClusters) ComputeClusters() error {
 	}
 	commFile.Close()
 
-	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities, 1000, 0.1)
+	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities)
 
 	slog.Info("writing output clusters...")
 	fi, err := os.Create("mapping.json")
@@ -183,18 +185,11 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 
 	g := NewGraph(sc.influencerMatrix)
 
-	// Twitter SimClusters parameters (from KDD 2020 paper)
-	const (
-		alpha                  = 10.0 // weight for edge coverage vs non-edge separation
-		maxCommPerNode         = 4    // l parameter - max communities per influencer
-		epsilon                = 0.05 // random exploration probability
-		maxNeighborCommunities = 4    // cap on neighborhood size for enumeration
-	)
-
 	influencerCommunities := ConcurrentMHSearchOverlapping(
 		g,
-		10_000,                 // numCommunities
-		1_000_000,              // totalIters (1M iterations total)
+		15_000,                 // numCommunities
+		200_000,                // iters per loop
+		15,                     // total loops
 		alpha,                  // alpha parameter
 		maxCommPerNode,         // max communities per node
 		epsilon,                // random exploration rate
@@ -225,7 +220,7 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 	}
 	commFile.Close()
 
-	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities, 1000, 0.1)
+	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities)
 
 	slog.Info("writing output clusters...")
 	fi, err := os.Create("mapping.json")
@@ -450,11 +445,14 @@ func NewGraph(edges map[matKey]float64) *Graph {
 	// Extract all nodes
 	var wg sync.WaitGroup
 
+	slog.Info("starting graph index construction", "edgeCount", len(edges))
+
 	wg.Go(func() {
 		for key, _ := range edges {
 			nodeMap[key.A] = true
 			nodeMap[key.B] = true
 		}
+		slog.Info("finished building node map", "nodeMapSize", len(nodeMap))
 	})
 
 	wg.Go(func() {
@@ -468,6 +466,7 @@ func NewGraph(edges map[matKey]float64) *Graph {
 				Weight: val,
 			})
 		}
+		slog.Info("finished building neighbors index", "size", len(g.Neighbors))
 	})
 
 	wg.Go(func() {
@@ -486,6 +485,7 @@ func NewGraph(edges map[matKey]float64) *Graph {
 			}
 			nsb[key.A] = val
 		}
+		slog.Info("finished building neighbor sets index", "size", len(g.NeighborSets))
 	})
 
 	wg.Wait()
@@ -494,19 +494,18 @@ func NewGraph(edges map[matKey]float64) *Graph {
 		g.Nodes = append(g.Nodes, nd)
 	}
 
-	/*
-		for _, v := range g.Neighbors {
-			slices.SortFunc(v, func(a, b neighborWeight) int {
-				if a.Weight > b.Weight {
-					return -1
-				}
-				if a.Weight < b.Weight {
-					return 1
-				}
-				return 0
-			})
-		}
-	*/
+	for _, v := range g.Neighbors {
+		slices.SortFunc(v, func(a, b neighborWeight) int {
+			if a.Weight > b.Weight {
+				return -1
+			}
+			if a.Weight < b.Weight {
+				return 1
+			}
+			return 0
+		})
+	}
+	slog.Info("finished sorting neighbor slices")
 
 	return g
 }
@@ -540,6 +539,31 @@ type communityStat struct {
 	nonNeighborCount float64
 }
 
+func selectNeighbors(Z ZMatrix, oneighbors []neighborWeight, oldSet *roaring64.Bitmap, n int, explore int) *roaring64.Bitmap {
+	neighbors := oneighbors
+	if len(neighbors) > n {
+		neighbors = neighbors[:n-explore]
+	}
+	neighborCommunities := oldSet.Clone()
+	for _, neighbor := range neighbors {
+		comms := Z[neighbor.Node]
+		neighborCommunities.Or(comms)
+	}
+
+	if len(neighbors) < len(oneighbors) {
+		// add some random extras
+		extran := oneighbors[n-explore:]
+
+		for i := 0; i < explore; i++ {
+			neighbor := extran[rand.Intn(len(extran))]
+			comms := Z[neighbor.Node]
+			neighborCommunities.Or(comms)
+		}
+	}
+
+	return neighborCommunities
+}
+
 // MetropolisHastingsOverlapping implements Twitter's Neighborhood-aware MH
 // for overlapping community detection using the F(Z) objective.
 //
@@ -559,7 +583,7 @@ func MetropolisHastingsOverlapping(
 	maxCommunitiesPerNode int,
 	epsilon float64,
 	maxNeighborCommunities int,
-) ZMatrix {
+) (ZMatrix, float64) {
 	Z := startingZ
 
 	// map from communities to users in them
@@ -594,13 +618,7 @@ func MetropolisHastingsOverlapping(
 
 		// Step 1: Collect communities from neighborhood
 		neighbors := graph.Neighbors[node]
-		nsets := make([]*roaring64.Bitmap, 0, len(neighbors))
-		for _, neighbor := range neighbors {
-			comms := Z[neighbor.Node]
-			nsets = append(nsets, comms)
-		}
-
-		neighborCommunities := roaring64.ParOr(2, nsets...)
+		neighborCommunities := selectNeighbors(Z, neighbors, oldSet, 50, 10)
 
 		// Step 2: Add random exploration with probability epsilon
 		if rand.Float64() < epsilon {
@@ -616,7 +634,10 @@ func MetropolisHastingsOverlapping(
 		neighborCommunities = limitNeighborhood(neighborCommunities, maxNeighborCommunities)
 
 		if neighborCommunities.IsEmpty() {
-			continue // isolated node, skip
+			// isolated node, propose some random communities
+			for i := 0; i < 5; i++ {
+				neighborCommunities.Add(rand.Uint64() % uint64(numCommunities))
+			}
 		}
 
 		// Step 4: Enumerate all subsets up to size maxCommunitiesPerNode
@@ -626,9 +647,6 @@ func MetropolisHastingsOverlapping(
 		enumerateSubsets(commList, maxCommunitiesPerNode, func(bm *roaring64.Bitmap) {
 			candidateSets = append(candidateSets, bm.Clone())
 		})
-
-		totalCsets += int64(len(candidateSets))
-		averageCsetSize = int(totalCsets) / int(iter+1)
 
 		// Step 5: Precompute per-community statistics ONCE, reuse for all candidates
 		// This avoids iterating through Zinv[comm] users multiple times
@@ -648,6 +666,9 @@ func MetropolisHastingsOverlapping(
 
 		var rcwg sync.WaitGroup
 		var cslk sync.Mutex
+
+		totalCsets += int64(allRelevantComms.GetCardinality())
+		averageCsetSize = int(totalCsets) / int(iter+1)
 
 		rciter := allRelevantComms.Iterator()
 		for rciter.HasNext() {
@@ -728,7 +749,7 @@ func MetropolisHastingsOverlapping(
 		// If rejected, Z[node] stays the same
 	}
 
-	return Z
+	return Z, deltaGain
 }
 
 func limitNeighborhood(neighborCommunities *roaring64.Bitmap, maxNeighborCommunities int) *roaring64.Bitmap {
@@ -864,7 +885,9 @@ func enumerateSubsets(communities []uint64, maxSize int, cb func(bm *roaring64.B
 
 	var permute func(n int, offs int)
 	permute = func(n int, offs int) {
-		cb(bm)
+		if n != maxSize {
+			cb(bm)
+		}
 		if n == 0 {
 			return
 		}
@@ -911,9 +934,11 @@ func sampleSoftmax(scores []float64) int {
 func initializeZNeighborhood(graph *Graph, numCommunities int) ZMatrix {
 	Z := make(ZMatrix)
 
-	// Initialize all nodes with empty bitmaps
+	// Initialize all nodes with fresh bitmaps and a random community
 	for _, node := range graph.Nodes {
-		Z[node] = roaring64.New()
+		nm := roaring64.New()
+		nm.Add(rand.Uint64() % uint64(numCommunities))
+		Z[node] = nm
 	}
 
 	// For each community, pick a random node and assign its neighborhood to that community
@@ -925,7 +950,11 @@ func initializeZNeighborhood(graph *Graph, numCommunities int) ZMatrix {
 		Z[seedNode].Add(uint64(commID))
 
 		// Assign all neighbors of seed to this community
-		for _, neighbor := range graph.Neighbors[seedNode] {
+		nbs := graph.Neighbors[seedNode]
+		if len(nbs) > 20 { // some fairly arbitrary limiting to make the initialized state a bit less messy
+			nbs = nbs[:20]
+		}
+		for _, neighbor := range nbs {
 			if neighbor.Node != seedNode {
 				Z[neighbor.Node].Add(uint64(commID))
 			}
@@ -935,6 +964,14 @@ func initializeZNeighborhood(graph *Graph, numCommunities int) ZMatrix {
 	return Z
 }
 
+func cloneZMatrix(in ZMatrix) ZMatrix {
+	out := make(ZMatrix, len(in))
+	for k, v := range in {
+		out[k] = v.Clone()
+	}
+	return out
+}
+
 // ConcurrentMHSearchOverlapping runs the complete overlapping community detection pipeline
 // using Twitter's F(Z) objective function.
 //
@@ -942,7 +979,8 @@ func initializeZNeighborhood(graph *Graph, numCommunities int) ZMatrix {
 func ConcurrentMHSearchOverlapping(
 	graph *Graph,
 	numCommunities int,
-	totalIters int,
+	itersPerLoop int,
+	nLoops int,
 	alpha float64,
 	maxCommunitiesPerNode int,
 	epsilon float64,
@@ -964,17 +1002,48 @@ func ConcurrentMHSearchOverlapping(
 	//slog.Info("Initialization complete", "F(Z)", initialScore)
 	initialScore := -1.0
 
-	// Run Metropolis-Hastings
-	finalZ := MetropolisHastingsOverlapping(
-		graph,
-		Z,
-		numCommunities,
-		totalIters,
-		alpha,
-		maxCommunitiesPerNode,
-		epsilon,
-		maxNeighborCommunities,
-	)
+	curZ := Z
+
+	nworkers := 3
+
+	for i := 0; i < nLoops; i++ {
+		var bestLk sync.Mutex
+		var bestZ ZMatrix
+		var bestGain float64 = -1
+
+		var wg sync.WaitGroup
+
+		for range nworkers {
+			subZ := cloneZMatrix(curZ)
+
+			wg.Go(func() {
+				// Run Metropolis-Hastings
+				finalZ, gain := MetropolisHastingsOverlapping(
+					graph,
+					subZ,
+					numCommunities,
+					itersPerLoop,
+					alpha,
+					maxCommunitiesPerNode,
+					epsilon,
+					maxNeighborCommunities,
+				)
+
+				bestLk.Lock()
+				if gain > bestGain {
+					bestGain = gain
+					bestZ = finalZ
+				}
+				bestLk.Unlock()
+			})
+		}
+
+		wg.Wait()
+
+		if bestZ != nil {
+			curZ = bestZ
+		}
+	}
 
 	// Compute final F(Z)
 	//finalScore := computeF(graph, finalZ, alpha)
@@ -984,9 +1053,11 @@ func ConcurrentMHSearchOverlapping(
 	// Convert binary Z to weighted scores
 	// For now, we'll use a simple normalization: score = 1.0 / |Z(u)| for each community
 	// This gives equal weight to all communities a node belongs to
+	var missingCommunities int
 	result := make(map[int64]map[int]float64)
-	for node, communities := range finalZ {
+	for node, communities := range curZ {
 		if communities.IsEmpty() {
+			missingCommunities++
 			continue // skip nodes with no community assignment
 		}
 		result[node] = make(map[int]float64)
@@ -1008,12 +1079,43 @@ func ConcurrentMHSearchOverlapping(
 	slog.Info("Community assignment statistics",
 		"nodes_with_communities", len(result),
 		"total_assignments", totalAssignments,
+		"missing_communities", missingCommunities,
 		"avg_communities_per_node", avgCommPerNode)
 
 	return result
 }
 
-func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]map[int]float64, numCommunities int, minThresh float64) map[int64]map[int]float64 {
+func topNInterests(raw map[int]float64, n int) map[int]float64 {
+	if len(raw) < n {
+		return raw
+	}
+
+	type pair struct {
+		K int
+		V float64
+	}
+
+	var all []pair
+	for k, v := range raw {
+		all = append(all, pair{K: k, V: v})
+	}
+
+	slices.SortFunc(all, func(a, b pair) int {
+		if a.V > b.V {
+			return -1
+		}
+		return 1
+	})
+
+	out := make(map[int]float64)
+	for i := 0; i < n; i++ {
+		out[all[i].K] = all[i].V
+	}
+
+	return out
+}
+
+func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]map[int]float64) map[int64]map[int]float64 {
 	var lk sync.Mutex
 	interestedIn := make(map[int64]map[int]float64)
 
@@ -1049,13 +1151,11 @@ func ComputeInterestedIn(gi *GraphIndex, knownFor map[int64]map[int]float64, num
 			if total > 0 {
 				for comm, v := range interests {
 					v /= total
-					if v < minThresh {
-						delete(interests, comm)
-					} else {
-						interests[comm] = v
-					}
+					interests[comm] = v
 				}
 			}
+
+			interests = topNInterests(interests, 5)
 
 			if len(interests) > 0 {
 				lk.Lock()
