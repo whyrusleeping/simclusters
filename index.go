@@ -15,12 +15,12 @@ type GraphIndex struct {
 	// Forward index: follower -> list of users they follow
 	Following smap.Map[int64, *roaring64.Bitmap]
 	//Following    map[int64]*roaring64.Bitmap
-	followingLks []sync.Mutex
+	followingLocks []sync.Mutex
 
 	// Inverted index: followed (influencer) -> list of followers
 	//Followers    map[int64]*roaring64.Bitmap
 	Followers    smap.Map[int64, *roaring64.Bitmap]
-	followersLks []sync.Mutex
+	followersLocks []sync.Mutex
 
 	// User metadata
 	Users map[int64]*User
@@ -34,59 +34,14 @@ const numLocks = 100
 // NewGraphIndex creates a new graph index
 func NewGraphIndex() *GraphIndex {
 	return &GraphIndex{
-		//Following:        make(map[int64]*roaring64.Bitmap),
-		//Followers:        make(map[int64]*roaring64.Bitmap),
-		followingLks: make([]sync.Mutex, numLocks),
-		followersLks: make([]sync.Mutex, numLocks),
-		Users:        make(map[int64]*User),
-		Influencers:  make(map[int64]bool),
+		followingLocks: make([]sync.Mutex, numLocks),
+		followersLocks: make([]sync.Mutex, numLocks),
+		Users:          make(map[int64]*User),
+		Influencers:    make(map[int64]bool),
 	}
 }
 
-// AddEdge adds a follow edge to the index
-
-/*
-func (gi *GraphIndex) AddEdge(from, to int64) {
-	// Add to forward index
-	gi.followingLks[from%numLocks].Lock()
-	if _, exists := gi.Following[from]; !exists {
-		gi.Following[from] = roaring64.New()
-	}
-	gi.Following[from].Add(uint64(to))
-	gi.followingLks[from%numLocks].Unlock()
-
-	// Add to inverted index
-	gi.followersLks[to%numLocks].Lock()
-	if _, exists := gi.Followers[to]; !exists {
-		gi.Followers[to] = roaring64.New()
-	}
-	gi.Followers[to].Add(uint64(from))
-	gi.followersLks[to%numLocks].Unlock()
-
-	gi.mu.Lock()
-	defer gi.mu.Unlock()
-	// Ensure users exist
-	if _, exists := gi.Users[from]; !exists {
-		gi.Users[from] = &User{
-			ID:            from,
-			FollowerCount: 0,
-			IsInfluencer:  false,
-		}
-	}
-
-	if touser, exists := gi.Users[to]; !exists {
-		gi.Users[to] = &User{
-			ID:            to,
-			FollowerCount: 1,
-			IsInfluencer:  false,
-		}
-	} else {
-		touser.FollowerCount++
-	}
-}
-*/
-
-// This uses a lot more memory
+// AddEdgesBatch adds multiple follow edges to the index in batch
 func (gi *GraphIndex) AddEdgesBatch(edges []Edge) {
 	following := make(map[int64]*roaring64.Bitmap)
 	followers := make(map[int64]*roaring64.Bitmap)
@@ -117,9 +72,9 @@ func (gi *GraphIndex) AddEdgesBatch(edges []Edge) {
 			fmap = roaring64.New()
 			gi.Following.Store(k, fmap)
 		}
-		gi.followingLks[k%numLocks].Lock()
+		gi.followingLocks[k%numLocks].Lock()
 		fmap.Or(v)
-		gi.followingLks[k%numLocks].Unlock()
+		gi.followingLocks[k%numLocks].Unlock()
 	}
 
 	for k, v := range followers {
@@ -128,9 +83,9 @@ func (gi *GraphIndex) AddEdgesBatch(edges []Edge) {
 			fmap = roaring64.New()
 			gi.Followers.Store(k, fmap)
 		}
-		gi.followersLks[k%numLocks].Lock()
+		gi.followersLocks[k%numLocks].Lock()
 		fmap.Or(v)
-		gi.followersLks[k%numLocks].Unlock()
+		gi.followersLocks[k%numLocks].Unlock()
 	}
 
 	gi.mu.Lock()
@@ -165,9 +120,9 @@ func (gi *GraphIndex) AddEdges(edges []Edge) {
 			fmap = roaring64.New()
 			gi.Following.Store(e.From, fmap)
 		}
-		gi.followingLks[e.From%numLocks].Lock()
+		gi.followingLocks[e.From%numLocks].Lock()
 		fmap.Add(uint64(e.To))
-		gi.followingLks[e.From%numLocks].Unlock()
+		gi.followingLocks[e.From%numLocks].Unlock()
 	}
 
 	// Add to inverted index
@@ -177,9 +132,9 @@ func (gi *GraphIndex) AddEdges(edges []Edge) {
 			fmap = roaring64.New()
 			gi.Followers.Store(e.To, fmap)
 		}
-		gi.followersLks[e.To%numLocks].Lock()
+		gi.followersLocks[e.To%numLocks].Lock()
 		fmap.Add(uint64(e.From))
-		gi.followersLks[e.To%numLocks].Unlock()
+		gi.followersLocks[e.To%numLocks].Unlock()
 	}
 
 	gi.mu.Lock()

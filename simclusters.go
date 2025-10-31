@@ -47,8 +47,7 @@ func NewSimClusters(config *Config) *SimClusters {
 
 // IngestEdges adds multiple edges to the graph
 func (sc *SimClusters) IngestEdges(edges []Edge) {
-	//sc.graphIndex.AddEdges(edges)
-	sc.graphIndex.AddEdgesBatch(edges) // not using this for now because it uses too much extra memory
+	sc.graphIndex.AddEdgesBatch(edges)
 }
 
 const (
@@ -57,6 +56,32 @@ const (
 	epsilon                = 0.08 // random exploration probability
 	maxNeighborCommunities = 7    // cap on neighborhood size for enumeration
 )
+
+// saveClusteringResults saves influencer communities and user mapping to JSON files
+func (sc *SimClusters) saveClusteringResults(influencerCommunities map[int64]map[int]float64) error {
+	// Save influencer communities mapping
+	slog.Info("writing influencer communities...")
+	commFile, err := os.Create("influencer_communities.json")
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(commFile).Encode(influencerCommunities); err != nil {
+		commFile.Close()
+		return err
+	}
+	commFile.Close()
+
+	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities)
+
+	slog.Info("writing output clusters...")
+	fi, err := os.Create("mapping.json")
+	if err != nil {
+		return err
+	}
+	defer fi.Close()
+
+	return json.NewEncoder(fi).Encode(clusters)
+}
 
 // ComputeClusters performs the full clustering computation
 func (sc *SimClusters) ComputeClusters() error {
@@ -120,30 +145,7 @@ func (sc *SimClusters) ComputeClusters() error {
 		"influencers_assigned", len(influencerCommunities),
 		"unique_communities", len(uniqueCommunities))
 
-	// Save influencer communities mapping
-	slog.Info("writing influencer communities...")
-	commFile, err := os.Create("influencer_communities.json")
-	if err != nil {
-		return err
-	}
-	if err := json.NewEncoder(commFile).Encode(influencerCommunities); err != nil {
-		commFile.Close()
-		return err
-	}
-	commFile.Close()
-
-	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities)
-
-	slog.Info("writing output clusters...")
-	fi, err := os.Create("mapping.json")
-	if err != nil {
-		return err
-	}
-	defer fi.Close()
-
-	return json.NewEncoder(fi).Encode(clusters)
-	//sc.needsFullRecompute = false
-	//sc.updateEpoch++
+	return sc.saveClusteringResults(influencerCommunities)
 }
 
 // ComputeClustersFromCheckpoint loads state from checkpoint and continues with Metropolis-Hastings
@@ -162,17 +164,6 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 	sc.graphIndex = state.GraphIndex
 	sc.influencerMatrix = state.InfluencerMatrix
 	influencers := state.Influencers
-
-	var selfEdges int
-	var sew float64
-	for edge, weight := range sc.influencerMatrix {
-		if edge.A == edge.B {
-			selfEdges++
-			sew += weight
-		}
-	}
-
-	slog.Info("self edge scan results", "selfEdges", selfEdges, "sew", sew)
 
 	slog.Info("Checkpoint loaded", "influencers", len(influencers), "matrix_edges", len(sc.influencerMatrix))
 
@@ -208,28 +199,7 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 		"influencers_assigned", len(influencerCommunities),
 		"unique_communities", len(uniqueCommunities))
 
-	// Save influencer communities mapping
-	slog.Info("writing influencer communities...")
-	commFile, err := os.Create("influencer_communities.json")
-	if err != nil {
-		return err
-	}
-	if err := json.NewEncoder(commFile).Encode(influencerCommunities); err != nil {
-		commFile.Close()
-		return err
-	}
-	commFile.Close()
-
-	clusters := ComputeInterestedIn(sc.graphIndex, influencerCommunities)
-
-	slog.Info("writing output clusters...")
-	fi, err := os.Create("mapping.json")
-	if err != nil {
-		return err
-	}
-	defer fi.Close()
-
-	return json.NewEncoder(fi).Encode(clusters)
+	return sc.saveClusteringResults(influencerCommunities)
 }
 
 // SaveCheckpoint saves the current state to disk
@@ -351,7 +321,6 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	var wg sync.WaitGroup
 
 	var skipped uint64
-	var underhalf, bottom90 uint64
 	for i, uid := range influencers {
 		wg.Add(1)
 		sema <- struct{}{}
@@ -403,7 +372,7 @@ func (sc *SimClusters) initializeInfluencerEdges(influencers []int64, minThresh 
 	wg.Wait()
 	bar.Finish()
 
-	slog.Info("minhash skipped pairs", "count", skipped, "50perc", underhalf, "90perc", bottom90)
+	slog.Info("minhash skipped pairs", "count", skipped)
 
 	var minval float64 = 100000000
 	var maxval, sum float64
@@ -810,70 +779,6 @@ func hasIntersection(a, b *roaring64.Bitmap) bool {
 	return a.Intersects(b)
 }
 
-// computeF calculates the global F(Z) objective function:
-// F(Z) = α·Σ_(u,v)∈E 𝟙(|Z(u)∩Z(v)| > 0) + Σ_(u,v)∉E 𝟙(|Z(u)∩Z(v)| = 0)
-//
-// This counts:
-// - How many edge pairs share ≥1 community (weighted by alpha)
-// - How many non-edge pairs share 0 communities
-func computeF(graph *Graph, Z ZMatrix, alpha float64) float64 {
-	var edgeTerm float64
-
-	// Edge term: iterate over all edges
-	for edge := range graph.Edges {
-		zA := Z[edge.A]
-		zB := Z[edge.B]
-		if hasIntersection(zA, zB) {
-			edgeTerm += 1.0
-		}
-	}
-
-	// Non-edge term optimization:
-	// Non-edges with 0 shared communities = Total non-edges - Non-edges with ≥1 shared community
-	numNodes := len(graph.Nodes)
-	totalPairs := numNodes * (numNodes - 1) / 2
-	totalNonEdges := float64(totalPairs - len(graph.Edges))
-
-	// Build community membership lists
-	commMembers := make(map[int][]int64)
-	for node, communities := range Z {
-		iter := communities.Iterator()
-		for iter.HasNext() {
-			comm := int(iter.Next())
-			commMembers[comm] = append(commMembers[comm], node)
-		}
-	}
-
-	// Count pairs that share ≥1 community
-	pairsSharingComm := make(map[matKey]bool)
-
-	for _, members := range commMembers {
-		// For each pair in this community
-		for i := 0; i < len(members); i++ {
-			for j := i + 1; j < len(members); j++ {
-				a, b := members[i], members[j]
-				if a > b {
-					a, b = b, a
-				}
-				pairsSharingComm[matKey{A: a, B: b}] = true
-			}
-		}
-	}
-
-	// Count how many pairs sharing communities are NON-edges
-	nonEdgesSharingComm := 0.0
-	for pair := range pairsSharingComm {
-		if _, ok := graph.Edges[pair]; ok {
-			nonEdgesSharingComm += 1.0
-		}
-	}
-
-	// Non-edges that DON'T share any community
-	nonEdgeTerm := totalNonEdges - nonEdgesSharingComm
-
-	return alpha*edgeTerm + nonEdgeTerm
-}
-
 // enumerateSubsets generates all subsets of communities with size <= maxSize
 // Returns list of community sets as roaring bitmaps
 func enumerateSubsets(communities []uint64, maxSize int, cb func(bm *roaring64.Bitmap)) {
@@ -997,9 +902,7 @@ func ConcurrentMHSearchOverlapping(
 	// Initialize Z using neighborhood seeding
 	Z := initializeZNeighborhood(graph, numCommunities)
 
-	// Compute initial F(Z)
-	//initialScore := computeF(graph, Z, alpha)
-	//slog.Info("Initialization complete", "F(Z)", initialScore)
+	// Compute initial F(Z) - disabled for performance
 	initialScore := -1.0
 
 	curZ := Z
@@ -1045,8 +948,7 @@ func ConcurrentMHSearchOverlapping(
 		}
 	}
 
-	// Compute final F(Z)
-	//finalScore := computeF(graph, finalZ, alpha)
+	// Compute final F(Z) - disabled for performance
 	finalScore := -1.0
 	slog.Info("MH optimization complete", "final_F(Z)", finalScore, "improvement", finalScore-initialScore)
 

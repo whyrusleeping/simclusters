@@ -3,14 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -290,14 +288,6 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 	fmt.Printf("Found %d unique communities\n", len(commToInfluencers))
 	fmt.Printf("Found %d users\n", len(userMappings))
 
-	/*
-		mat, err := loadMatrixBin("checkpoint-big5/matrix.bin")
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Loaded %d edges\n", len(mat))
-	*/
-
 	fmt.Println("\nEnter DIDs or handles to query (or 'quit' to exit):")
 
 	// Interactive REPL
@@ -420,15 +410,6 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 		for commID, score := range infcom {
 			printCommunity(commID, score)
 		}
-
-		/*
-			fmt.Println("Influencer edges for user")
-			for k, v := range mat {
-				if k.A == nodeID || k.B == nodeID {
-					fmt.Printf("%d -> %d: %f\n", k.A, k.B, v)
-				}
-			}
-		*/
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -441,47 +422,6 @@ func runQuery(ctx context.Context, cmd *cli.Command) error {
 
 type matKey struct {
 	A, B int64
-}
-
-func loadMatrixBin(path string) (map[matKey]float64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	r := bufio.NewReaderSize(f, 256*1024)
-
-	// Read count
-	var count int64
-	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
-		return nil, fmt.Errorf("failed to read count: %w", err)
-	}
-
-	// Read matrix entries
-	matrix := make(map[matKey]float64, count)
-	buf := make([]byte, 24)
-	for i := int64(0); i < count; i++ {
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
-
-		var a, b int64
-		var val float64
-
-		a = int64(binary.LittleEndian.Uint64(buf[:8]))
-		b = int64(binary.LittleEndian.Uint64(buf[8:16]))
-		valb := binary.LittleEndian.Uint64(buf[16:])
-		val = math.Float64frombits(valb)
-
-		matrix[matKey{A: a, B: b}] = val
-
-		if (i+1)%int64(10000) == 0 {
-			slog.Debug("Matrix load progress", "loaded", i+1, "total", count)
-		}
-	}
-
-	return matrix, nil
 }
 
 func runDebugUsers(ctx context.Context, cmd *cli.Command) error {
