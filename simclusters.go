@@ -126,7 +126,7 @@ func (sc *SimClusters) ComputeClusters() error {
 		g,
 		15_000,                 // numCommunities
 		200_000,                // iters per loop
-		15,                     // total loops
+		25,                     // total loops
 		alpha,                  // alpha parameter
 		maxCommPerNode,         // max communities per node
 		epsilon,                // random exploration rate
@@ -180,7 +180,7 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(checkpointPath string) erro
 		g,
 		15_000,                 // numCommunities
 		200_000,                // iters per loop
-		15,                     // total loops
+		25,                     // total loops
 		alpha,                  // alpha parameter
 		maxCommPerNode,         // max communities per node
 		epsilon,                // random exploration rate
@@ -552,6 +552,7 @@ func MetropolisHastingsOverlapping(
 	maxCommunitiesPerNode int,
 	epsilon float64,
 	maxNeighborCommunities int,
+	bar *progressbar.ProgressBar,
 ) (ZMatrix, float64) {
 	Z := startingZ
 
@@ -571,16 +572,14 @@ func MetropolisHastingsOverlapping(
 		}
 	}
 
-	bar := progressbar.Default(int64(maxIters))
-
 	var deltaGain float64
 
 	var totalCsets int64
-	var averageCsetSize int
+	//var averageCsetSize int
 
 	for iter := 0; iter < maxIters; iter++ {
 		bar.Add(1)
-		bar.Describe(fmt.Sprintf("dg: %0.1f, avcss: %d", deltaGain, averageCsetSize))
+		//bar.Describe(fmt.Sprintf("dg: %0.1f, avcss: %d", deltaGain, averageCsetSize))
 		// Pick a random node
 		node := graph.Nodes[rand.Intn(len(graph.Nodes))]
 		oldSet := Z[node]
@@ -622,52 +621,10 @@ func MetropolisHastingsOverlapping(
 		neighborSet := graph.NeighborSets[node]
 		nonEdgeScore := 1.0 / alpha
 
-		// Cache: for each community, store (neighbor_weight_sum, non_neighbor_count)
-		commStats := make(map[uint64]communityStat)
+		commStats := computeCommunityStats(oldSet, candidateSets, Zinvert, neighborSet)
 
-		// Build union of all communities we'll need (from oldSet and all candidates)
-		allRelevantComms := oldSet.Clone()
-		for _, cset := range candidateSets {
-			allRelevantComms.Or(cset)
-		}
-
-		// Compute statistics once per community
-
-		var rcwg sync.WaitGroup
-		var cslk sync.Mutex
-
-		totalCsets += int64(allRelevantComms.GetCardinality())
-		averageCsetSize = int(totalCsets) / int(iter+1)
-
-		rciter := allRelevantComms.Iterator()
-		for rciter.HasNext() {
-			comm := rciter.Next()
-			rcwg.Go(func() {
-				users, ok := Zinvert[comm]
-				if !ok {
-					return
-				}
-
-				var neighborWeight float64
-				var nonNeighborCount float64
-
-				for user := range users {
-					if nw, isNeighbor := neighborSet[user]; isNeighbor {
-						neighborWeight += nw
-					} else {
-						nonNeighborCount += 1.0
-					}
-				}
-
-				cslk.Lock()
-				commStats[comm] = struct {
-					neighborWeight   float64
-					nonNeighborCount float64
-				}{neighborWeight, nonNeighborCount}
-				cslk.Unlock()
-			})
-		}
-		rcwg.Wait()
+		totalCsets += int64(len(commStats))
+		//averageCsetSize = int(totalCsets) / int(iter+1)
 
 		// Step 6: Compute deltas using cached statistics
 		scores := make([]float64, len(candidateSets))
@@ -877,6 +834,203 @@ func cloneZMatrix(in ZMatrix) ZMatrix {
 	return out
 }
 
+// evaluateCandidateSet computes the score for a community set given precomputed stats.
+// Higher scores are better (more neighbors in shared communities, fewer non-neighbors).
+func evaluateCandidateSet(cset *roaring64.Bitmap, commStats map[uint64]communityStat, nonEdgeScore float64) float64 {
+	var score float64
+	iter := cset.Iterator()
+	for iter.HasNext() {
+		comm := iter.Next()
+		if stats, ok := commStats[comm]; ok {
+			score += stats.neighborWeight
+			score -= stats.nonNeighborCount * nonEdgeScore
+		}
+	}
+	return score
+}
+
+// computeCommunityStats precomputes statistics for all relevant communities across candidate sets.
+// Returns a map of community -> (neighborWeight, nonNeighborCount) statistics.
+func computeCommunityStats(
+	oldSet *roaring64.Bitmap,
+	candidateSets []*roaring64.Bitmap,
+	Zinvert map[uint64]map[int64]bool,
+	neighborSet map[int64]float64,
+) map[uint64]communityStat {
+	// Build union of all communities we'll need (from oldSet and all candidates)
+	allRelevantComms := oldSet.Clone()
+	for _, cset := range candidateSets {
+		allRelevantComms.Or(cset)
+	}
+
+	// Compute statistics once per community in parallel
+	commStats := make(map[uint64]communityStat)
+	var rcwg sync.WaitGroup
+	var cslk sync.Mutex
+
+	rciter := allRelevantComms.Iterator()
+	for rciter.HasNext() {
+		comm := rciter.Next()
+		rcwg.Go(func() {
+			users, ok := Zinvert[comm]
+			if !ok {
+				return
+			}
+
+			var neighborWeight float64
+			var nonNeighborCount float64
+
+			for user := range users {
+				if nw, isNeighbor := neighborSet[user]; isNeighbor {
+					neighborWeight += nw
+				} else {
+					nonNeighborCount += 1.0
+				}
+			}
+
+			cslk.Lock()
+			commStats[comm] = communityStat{
+				neighborWeight:   neighborWeight,
+				nonNeighborCount: nonNeighborCount,
+			}
+			cslk.Unlock()
+		})
+	}
+	rcwg.Wait()
+
+	return commStats
+}
+
+// DeterministicSweepOverlapping performs one pass through all nodes in deterministic order,
+// updating each node's community assignment exactly once. This ensures no nodes are missed
+// by random sampling in the main MH loop.
+func DeterministicSweepOverlapping(
+	graph *Graph,
+	startingZ ZMatrix,
+	numCommunities int,
+	alpha float64,
+	maxCommunitiesPerNode int,
+	epsilon float64,
+	maxNeighborCommunities int,
+) (ZMatrix, float64) {
+	Z := startingZ
+
+	// Build inverted index
+	Zinvert := make(map[uint64]map[int64]bool)
+	for u, cset := range Z {
+		iter := cset.Iterator()
+		for iter.HasNext() {
+			c := iter.Next()
+			umap, ok := Zinvert[c]
+			if !ok {
+				umap = make(map[int64]bool)
+				Zinvert[c] = umap
+			}
+			umap[u] = true
+		}
+	}
+
+	bar := progressbar.Default(int64(len(graph.Nodes)))
+	var totalGain float64
+
+	// Iterate through ALL nodes in order (not randomly)
+	for _, node := range graph.Nodes {
+		bar.Add(1)
+
+		oldSet := Z[node]
+
+		// Collect communities from neighborhood
+		neighbors := graph.Neighbors[node]
+		neighborCommunities := selectNeighbors(Z, neighbors, oldSet, 50, 10)
+
+		// Random exploration with probability epsilon
+		if rand.Float64() < epsilon {
+			numRandom := 1 + rand.Intn(2)
+			for i := 0; i < numRandom && int(neighborCommunities.GetCardinality()) < maxNeighborCommunities; i++ {
+				randomComm := rand.Intn(numCommunities)
+				neighborCommunities.Add(uint64(randomComm))
+			}
+		}
+
+		// Cap neighborhood communities
+		neighborCommunities = limitNeighborhood(neighborCommunities, maxNeighborCommunities)
+
+		if neighborCommunities.IsEmpty() {
+			// Isolated node, propose random communities
+			for i := 0; i < 5; i++ {
+				neighborCommunities.Add(rand.Uint64() % uint64(numCommunities))
+			}
+		}
+
+		// Enumerate all subsets up to maxCommunitiesPerNode
+		commList := neighborCommunities.ToArray()
+		candidateSets := make([]*roaring64.Bitmap, 0, 16)
+		enumerateSubsets(commList, maxCommunitiesPerNode, func(bm *roaring64.Bitmap) {
+			candidateSets = append(candidateSets, bm.Clone())
+		})
+
+		// Precompute per-community statistics
+		neighborSet := graph.NeighborSets[node]
+		nonEdgeScore := 1.0 / alpha
+
+		commStats := computeCommunityStats(oldSet, candidateSets, Zinvert, neighborSet)
+
+		// Evaluate all candidate sets using precomputed stats
+		scores := make([]float64, len(candidateSets))
+		for i, cset := range candidateSets {
+			scores[i] = evaluateCandidateSet(cset, commStats, nonEdgeScore)
+		}
+
+		// Find best candidate
+		bestIdx := 0
+		bestScore := scores[0]
+		for i := 1; i < len(scores); i++ {
+			if scores[i] > bestScore {
+				bestScore = scores[i]
+				bestIdx = i
+			}
+		}
+
+		newSet := candidateSets[bestIdx]
+		gain := bestScore - evaluateCandidateSet(oldSet, commStats, nonEdgeScore)
+
+		// Accept if improvement (greedy)
+		if gain > 0 {
+			totalGain += gain
+
+			// Update Z
+			Z[node] = newSet.Clone()
+
+			// Update Zinvert
+			oldIter := oldSet.Iterator()
+			for oldIter.HasNext() {
+				comm := oldIter.Next()
+				if users, ok := Zinvert[comm]; ok {
+					delete(users, node)
+					if len(users) == 0 {
+						delete(Zinvert, comm)
+					}
+				}
+			}
+
+			newIter := newSet.Iterator()
+			for newIter.HasNext() {
+				comm := newIter.Next()
+				if users, ok := Zinvert[comm]; ok {
+					users[node] = true
+				} else {
+					Zinvert[comm] = map[int64]bool{node: true}
+				}
+			}
+		}
+	}
+
+	bar.Finish()
+	slog.Info("Deterministic sweep complete", "nodes_updated", len(graph.Nodes), "total_gain", totalGain)
+
+	return Z, totalGain
+}
+
 // ConcurrentMHSearchOverlapping runs the complete overlapping community detection pipeline
 // using Twitter's F(Z) objective function.
 //
@@ -907,15 +1061,18 @@ func ConcurrentMHSearchOverlapping(
 
 	curZ := Z
 
-	nworkers := 3
+	nworkers := 5
 
 	for i := 0; i < nLoops; i++ {
 		var bestLk sync.Mutex
 		var bestZ ZMatrix
 		var bestGain float64 = -1
 
+		var totalGain float64
+
 		var wg sync.WaitGroup
 
+		bar := progressbar.Default(int64(itersPerLoop * nworkers))
 		for range nworkers {
 			subZ := cloneZMatrix(curZ)
 
@@ -930,9 +1087,11 @@ func ConcurrentMHSearchOverlapping(
 					maxCommunitiesPerNode,
 					epsilon,
 					maxNeighborCommunities,
+					bar,
 				)
 
 				bestLk.Lock()
+				totalGain += gain
 				if gain > bestGain {
 					bestGain = gain
 					bestZ = finalZ
@@ -942,9 +1101,25 @@ func ConcurrentMHSearchOverlapping(
 		}
 
 		wg.Wait()
+		bar.Finish()
 
 		if bestZ != nil {
 			curZ = bestZ
+		}
+
+		slog.Info("optimizer loop finished", "iter", i, "gain", bestGain, "deltagain", bestGain-(totalGain/float64(nworkers)))
+
+		if i > 0 && i%5 == 0 {
+			slog.Info("Running deterministic sweep of all nodes...")
+			curZ, _ = DeterministicSweepOverlapping(
+				graph,
+				curZ,
+				numCommunities,
+				alpha,
+				maxCommunitiesPerNode,
+				epsilon,
+				maxNeighborCommunities,
+			)
 		}
 	}
 

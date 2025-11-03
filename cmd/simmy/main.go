@@ -12,6 +12,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,9 +28,17 @@ import (
 )
 
 func main() {
+	// Enable profiling for mutex contention and blocking
+	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(1)
+
 	// Start pprof server
 	go func() {
-		http.ListenAndServe(":9123", nil)
+		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		log.Info("pprof server listening", "addr", "http://localhost:9123/debug/pprof")
+		if err := http.ListenAndServe(":9123", nil); err != nil {
+			log.Error("pprof server failed", "error", err)
+		}
 	}()
 
 	cmd := &cli.Command{
@@ -115,6 +124,7 @@ func main() {
 				},
 				Action: runExportCSV,
 			},
+			buildDatasetCmd,
 		},
 	}
 
