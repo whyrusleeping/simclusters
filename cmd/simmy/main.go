@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -124,6 +125,34 @@ func main() {
 				},
 				Action: runExportCSV,
 			},
+			{
+				Name:  "cluster-posts",
+				Usage: "Find posts similar to a cluster's centroid embedding",
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "limit",
+						Usage: "Number of similar posts to return",
+						Value: 100,
+					},
+					&cli.IntFlag{
+						Name:  "days",
+						Usage: "Number of days to look back for cluster posts",
+						Value: 5,
+					},
+					&cli.StringFlag{
+						Name:  "model",
+						Usage: "Embedding model to filter by",
+						Value: "text-embedding-3-small",
+					},
+					&cli.StringFlag{
+						Name:    "influencers",
+						Aliases: []string{"i"},
+						Usage:   "Path to influencer_communities.json",
+						Value:   "influencer_communities.json",
+					},
+				},
+				Action: runClusterPosts,
+			},
 			buildDatasetCmd,
 		},
 	}
@@ -230,6 +259,27 @@ func runClustering(ctx context.Context, cmd *cli.Command) error {
 type Repo struct {
 	ID  int64  `gorm:"primaryKey;column:id"`
 	DID string `gorm:"column:did"`
+}
+
+// database table for post embeddings
+type PostEmbedding struct {
+	ID        int64  `gorm:"primaryKey;column:id"`
+	Post      int64  `gorm:"column:post"`
+	Model     string `gorm:"column:model"`
+	Embedding []byte `gorm:"column:embedding;type:halfvec(512)"`
+	CreatedAt string `gorm:"column:created_at"`
+	UpdatedAt string `gorm:"column:updated_at"`
+}
+
+// database table for posts
+type Post struct {
+	ID        int64   `gorm:"primaryKey;column:id"`
+	Created   string  `gorm:"column:created"`
+	Author    int64   `gorm:"column:author"`
+	Rkey      string  `gorm:"column:rkey"`
+	ReplyTo   *int64  `gorm:"column:reply_to"`
+	Reposting *int64  `gorm:"column:reposting"`
+	DeletedAt *string `gorm:"column:deleted_at"`
 }
 
 func runQuery(ctx context.Context, cmd *cli.Command) error {
@@ -698,6 +748,167 @@ func runExportCSV(ctx context.Context, cmd *cli.Command) error {
 	fmt.Printf("  Total rows written: %d\n", totalRows)
 	fmt.Printf("  Users without DIDs: %d\n", missingDIDs)
 	fmt.Printf("  Output file: %s\n", outputPath)
+
+	return nil
+}
+
+// buildDatasetCmd is a placeholder for future dataset building functionality
+var buildDatasetCmd = &cli.Command{
+	Name:  "build-dataset",
+	Usage: "Build a dataset (not yet implemented)",
+	Action: func(ctx context.Context, cmd *cli.Command) error {
+		return fmt.Errorf("not yet implemented")
+	},
+}
+
+func runClusterPosts(ctx context.Context, cmd *cli.Command) error {
+	// Parse cluster ID from positional argument
+	args := cmd.Args().Slice()
+	if len(args) == 0 {
+		return fmt.Errorf("cluster ID required as argument")
+	}
+
+	clusterID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid cluster ID: %w", err)
+	}
+
+	// Get flags
+	limit := cmd.Int("limit")
+	days := cmd.Int("days")
+	influencersPath := cmd.String("influencers")
+
+	// Connect to database
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		return fmt.Errorf("DATABASE_URL environment variable not set")
+	}
+
+	fmt.Println("Connecting to database...")
+	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Load influencer communities
+	fmt.Printf("Loading influencer communities from %s...\n", influencersPath)
+	inf, err := os.Open(influencersPath)
+	if err != nil {
+		return fmt.Errorf("failed to open influencer file: %w", err)
+	}
+	defer inf.Close()
+
+	var influencerCommunities map[int64]map[int64]float64
+	if err := json.NewDecoder(inf).Decode(&influencerCommunities); err != nil {
+		return fmt.Errorf("failed to decode influencer_communities.json: %w", err)
+	}
+
+	// Build reverse index: cluster -> influencers
+	var clusterInfluencers []int64
+	for influencerID, communities := range influencerCommunities {
+		if _, inCluster := communities[clusterID]; inCluster {
+			clusterInfluencers = append(clusterInfluencers, influencerID)
+		}
+	}
+
+	if len(clusterInfluencers) == 0 {
+		return fmt.Errorf("cluster %d not found or has no influencers", clusterID)
+	}
+
+	fmt.Printf("Found %d influencers in cluster %d\n", len(clusterInfluencers), clusterID)
+
+	// Use pgvector to compute centroid and find similar posts directly in PostgreSQL
+	// This is much more efficient than doing it in Go
+	fmt.Println("Computing cluster centroid and finding similar posts...")
+
+	query := `
+		WITH cluster_posts AS (
+			-- Get posts from cluster influencers in the time window
+			SELECT pe.embedding
+			FROM posts p
+			JOIN post_embeddings pe ON p.id = pe.post
+			WHERE p.author = ANY($1)
+			  AND p.reply_to = 0
+			  AND p.deleted_at IS NULL
+			  AND p.created >= NOW() - INTERVAL '` + fmt.Sprintf("%d days", days) + `'
+		),
+		centroid AS (
+			-- Compute the average embedding (centroid)
+			SELECT AVG(embedding) as avg_embedding
+			FROM cluster_posts
+		)
+		-- Find posts most similar to the centroid using cosine distance
+		SELECT
+			p.id,
+			p.author,
+			p.rkey,
+			p.created,
+			(pe.embedding <=> (SELECT avg_embedding FROM centroid)) as distance
+		FROM posts p
+		JOIN post_embeddings pe ON p.id = pe.post
+		WHERE p.deleted_at IS NULL AND p.created > $3
+		AND p.reply_to = 0 
+		AND (select likes from post_counts where post_counts.post = p.id) > 10
+		ORDER BY pe.embedding <=> (SELECT avg_embedding FROM centroid)
+		LIMIT $2
+	`
+
+	type PostResult struct {
+		ID       int64
+		Author   int64
+		Rkey     string
+		Created  string
+		Distance float64
+	}
+
+	oldestPost := time.Now().Add(time.Hour * 24 * -3)
+
+	var results []PostResult
+	if err := db.Raw(query, clusterInfluencers, limit, oldestPost).Scan(&results).Error; err != nil {
+		return fmt.Errorf("failed to query similar posts: %w", err)
+	}
+
+	if len(results) == 0 {
+		return fmt.Errorf("no similar posts found (cluster may have no posts with embeddings in the past %d days)", days)
+	}
+
+	fmt.Printf("Found %d similar posts\n", len(results))
+
+	// Look up DIDs for authors
+	authorIDs := make([]int64, len(results))
+	for i, result := range results {
+		authorIDs[i] = result.Author
+	}
+
+	var repos []Repo
+	if err := db.Table("repos").Where("id IN ?", authorIDs).Find(&repos).Error; err != nil {
+		return fmt.Errorf("failed to query repos: %w", err)
+	}
+
+	idToDID := make(map[int64]string)
+	for _, repo := range repos {
+		idToDID[repo.ID] = repo.DID
+	}
+
+	// Output results as AT Protocol URIs
+	fmt.Printf("\nTop %d posts similar to cluster %d centroid:\n\n", len(results), clusterID)
+	for i, result := range results {
+		_, ok := influencerCommunities[result.Author][clusterID]
+		if ok {
+			continue
+		}
+
+		did := idToDID[result.Author]
+		if did == "" {
+			did = fmt.Sprintf("unknown-user-%d", result.Author)
+		}
+
+		//uri := fmt.Sprintf("at://%s/app.bsky.feed.post/%s", did, result.Rkey)
+		uri := fmt.Sprintf("https://bsky.app/profile/%s/post/%s", did, result.Rkey)
+		// Convert distance to similarity (cosine distance = 1 - cosine similarity)
+		similarity := 1.0 - result.Distance
+		fmt.Printf("%3d. [%.4f] %s\n", i+1, similarity, uri)
+	}
 
 	return nil
 }

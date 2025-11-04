@@ -239,7 +239,7 @@ func (sc *SimClusters) identifyInfluencers() []int64 {
 
 	slog.Info("Influencer follower threshold", "count", topTenPerc, "99perc", ninetyNinePerc)
 
-	minFollows := 1500
+	minFollows := 1300
 	if topTenPerc < minFollows {
 		topTenPerc = minFollows
 	}
