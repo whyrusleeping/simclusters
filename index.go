@@ -1,281 +1,98 @@
 package simclusters
 
 import (
+	"cmp"
+	"slices"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
-	"github.com/schollz/progressbar/v3"
 	smap "github.com/zolstein/sync-map"
 )
 
-// GraphIndex maintains efficient indices for the follow graph
+// numLocks is the number of lock stripes guarding bitmap updates per
+// direction.
+const numLocks = 1024
+
+// GraphIndex holds the follow graph in both directions.
+//
+// AddEdgesBatch may be called from many goroutines at once. Reading bitmaps
+// is only safe once ingestion has finished.
 type GraphIndex struct {
-	mu sync.RWMutex
-
-	// Forward index: follower -> list of users they follow
+	// Following maps a user to the users they follow.
 	Following smap.Map[int64, *roaring64.Bitmap]
-	//Following    map[int64]*roaring64.Bitmap
-	followingLocks []sync.Mutex
+	// Followers maps a user to their followers.
+	Followers smap.Map[int64, *roaring64.Bitmap]
 
-	// Inverted index: followed (influencer) -> list of followers
-	//Followers    map[int64]*roaring64.Bitmap
-	Followers    smap.Map[int64, *roaring64.Bitmap]
-	followersLocks []sync.Mutex
-
-	// User metadata
-	Users map[int64]*User
-
-	// Influencer tracking
-	Influencers map[int64]bool
+	followingLocks [numLocks]sync.Mutex
+	followersLocks [numLocks]sync.Mutex
 }
 
-const numLocks = 100
-
-// NewGraphIndex creates a new graph index
+// NewGraphIndex creates an empty graph index.
 func NewGraphIndex() *GraphIndex {
-	return &GraphIndex{
-		followingLocks: make([]sync.Mutex, numLocks),
-		followersLocks: make([]sync.Mutex, numLocks),
-		Users:          make(map[int64]*User),
-		Influencers:    make(map[int64]bool),
-	}
+	return &GraphIndex{}
 }
 
-// AddEdgesBatch adds multiple follow edges to the index in batch
+// AddEdgesBatch adds follow edges to both directions of the index. Duplicate
+// edges are harmless. The slice is not retained, but it is reordered.
 func (gi *GraphIndex) AddEdgesBatch(edges []Edge) {
-	following := make(map[int64]*roaring64.Bitmap)
-	followers := make(map[int64]*roaring64.Bitmap)
+	var buf []uint64
 
-	// Add to forward index
-	for _, e := range edges {
-		fmap, ok := following[e.From]
-		if !ok {
-			fmap = roaring64.New()
-			following[e.From] = fmap
+	slices.SortFunc(edges, func(a, b Edge) int { return cmp.Compare(a.From, b.From) })
+	for i := 0; i < len(edges); {
+		from := edges[i].From
+		buf = buf[:0]
+		for ; i < len(edges) && edges[i].From == from; i++ {
+			buf = append(buf, uint64(edges[i].To))
 		}
-		fmap.Add(uint64(e.To))
+		addMany(&gi.Following, &gi.followingLocks, from, buf)
 	}
 
-	// Add to inverted index
-	for _, e := range edges {
-		fmap, ok := followers[e.To]
-		if !ok {
-			fmap = roaring64.New()
-			followers[e.To] = fmap
+	slices.SortFunc(edges, func(a, b Edge) int { return cmp.Compare(a.To, b.To) })
+	for i := 0; i < len(edges); {
+		to := edges[i].To
+		buf = buf[:0]
+		for ; i < len(edges) && edges[i].To == to; i++ {
+			buf = append(buf, uint64(edges[i].From))
 		}
-		fmap.Add(uint64(e.From))
-	}
-
-	for k, v := range following {
-		fmap, ok := gi.Following.Load(k)
-		if !ok {
-			fmap = roaring64.New()
-			gi.Following.Store(k, fmap)
-		}
-		gi.followingLocks[k%numLocks].Lock()
-		fmap.Or(v)
-		gi.followingLocks[k%numLocks].Unlock()
-	}
-
-	for k, v := range followers {
-		fmap, ok := gi.Followers.Load(k)
-		if !ok {
-			fmap = roaring64.New()
-			gi.Followers.Store(k, fmap)
-		}
-		gi.followersLocks[k%numLocks].Lock()
-		fmap.Or(v)
-		gi.followersLocks[k%numLocks].Unlock()
-	}
-
-	gi.mu.Lock()
-	defer gi.mu.Unlock()
-	// Ensure users exist
-	for _, e := range edges {
-		if _, exists := gi.Users[e.From]; !exists {
-			gi.Users[e.From] = &User{
-				ID:            e.From,
-				FollowerCount: 0,
-				IsInfluencer:  false,
-			}
-		}
-
-		if touser, exists := gi.Users[e.To]; !exists {
-			gi.Users[e.To] = &User{
-				ID:            e.To,
-				FollowerCount: 1,
-				IsInfluencer:  false,
-			}
-		} else {
-			touser.FollowerCount++
-		}
+		addMany(&gi.Followers, &gi.followersLocks, to, buf)
 	}
 }
 
-func (gi *GraphIndex) AddEdges(edges []Edge) {
-	// Add to forward index
-	for _, e := range edges {
-		fmap, ok := gi.Following.Load(e.From)
-		if !ok {
-			fmap = roaring64.New()
-			gi.Following.Store(e.From, fmap)
-		}
-		gi.followingLocks[e.From%numLocks].Lock()
-		fmap.Add(uint64(e.To))
-		gi.followingLocks[e.From%numLocks].Unlock()
+func addMany(m *smap.Map[int64, *roaring64.Bitmap], locks *[numLocks]sync.Mutex, key int64, vals []uint64) {
+	bm, ok := m.Load(key)
+	if !ok {
+		// LoadOrStore, so that two goroutines creating the same key agree
+		// on one bitmap.
+		bm, _ = m.LoadOrStore(key, roaring64.New())
 	}
-
-	// Add to inverted index
-	for _, e := range edges {
-		fmap, ok := gi.Followers.Load(e.To)
-		if !ok {
-			fmap = roaring64.New()
-			gi.Followers.Store(e.To, fmap)
-		}
-		gi.followersLocks[e.To%numLocks].Lock()
-		fmap.Add(uint64(e.From))
-		gi.followersLocks[e.To%numLocks].Unlock()
-	}
-
-	gi.mu.Lock()
-	defer gi.mu.Unlock()
-	// Ensure users exist
-	for _, e := range edges {
-		if _, exists := gi.Users[e.From]; !exists {
-			gi.Users[e.From] = &User{
-				ID:            e.From,
-				FollowerCount: 0,
-				IsInfluencer:  false,
-			}
-		}
-
-		if touser, exists := gi.Users[e.To]; !exists {
-			gi.Users[e.To] = &User{
-				ID:            e.To,
-				FollowerCount: 1,
-				IsInfluencer:  false,
-			}
-		} else {
-			touser.FollowerCount++
-		}
-	}
+	lk := &locks[uint64(key)%numLocks]
+	lk.Lock()
+	bm.AddMany(vals)
+	lk.Unlock()
 }
 
-func (gi *GraphIndex) OptimizeIndex() {
-	bar := progressbar.Default(-1)
-
-	sema := make(chan struct{}, 100)
-	var wg sync.WaitGroup
-	gi.Following.Range(func(user int64, vals *roaring64.Bitmap) bool {
-		wg.Add(1)
-		sema <- struct{}{}
-		go func(bm *roaring64.Bitmap) {
-			defer func() {
-				bar.Add(1)
-				<-sema
-				wg.Done()
-			}()
-			bm.RunOptimize()
-		}(vals)
-		return true
-	})
-
-	gi.Followers.Range(func(user int64, vals *roaring64.Bitmap) bool {
-		wg.Add(1)
-		sema <- struct{}{}
-		go func(bm *roaring64.Bitmap) {
-			defer func() {
-				bar.Add(1)
-				<-sema
-				wg.Done()
-			}()
-			bm.RunOptimize()
-		}(vals)
-		return true
-	})
-
-	wg.Wait()
-}
-
-// GetFollowing returns the bitmap of users that a given user follows
+// GetFollowing returns the users that userID follows. The result must not be
+// modified.
 func (gi *GraphIndex) GetFollowing(userID int64) *roaring64.Bitmap {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	if following, exists := gi.Following.Load(userID); exists {
-		return following
+	if bm, ok := gi.Following.Load(userID); ok {
+		return bm
 	}
 	return roaring64.New()
 }
 
-// GetFollowers returns the bitmap of followers for a given user
+// GetFollowers returns the followers of userID. The result must not be
+// modified.
 func (gi *GraphIndex) GetFollowers(userID int64) *roaring64.Bitmap {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	if followers, exists := gi.Followers.Load(userID); exists {
-		return followers
+	if bm, ok := gi.Followers.Load(userID); ok {
+		return bm
 	}
 	return roaring64.New()
 }
 
-// GetUser returns user metadata
-func (gi *GraphIndex) GetUser(userID int64) *User {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	return gi.Users[userID]
-}
-
-// SetUser updates user metadata
-func (gi *GraphIndex) SetUser(user *User) {
-	gi.mu.Lock()
-	defer gi.mu.Unlock()
-
-	gi.Users[user.ID] = user
-}
-
-// MarkInfluencer marks a user as an influencer
-func (gi *GraphIndex) MarkInfluencer(userID int64) {
-	gi.mu.Lock()
-	defer gi.mu.Unlock()
-
-	gi.Influencers[userID] = true
-	if user, exists := gi.Users[userID]; exists {
-		user.IsInfluencer = true
-	}
-}
-
-// GetInfluencers returns all influencer user IDs
-func (gi *GraphIndex) GetInfluencers() []int64 {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	result := make([]int64, 0, len(gi.Influencers))
-	for uid := range gi.Influencers {
-		result = append(result, uid)
-	}
-	return result
-}
-
-// GetFollowingCount returns the number of users a given user follows
-func (gi *GraphIndex) GetFollowingCount(userID int64) int {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	if following, exists := gi.Following.Load(userID); exists {
-		return int(following.GetCardinality())
-	}
-	return 0
-}
-
-// GetFollowerCount returns the number of followers for a given user
-func (gi *GraphIndex) GetFollowerCount(userID int64) int32 {
-	gi.mu.RLock()
-	defer gi.mu.RUnlock()
-
-	if user, exists := gi.Users[userID]; exists {
-		return user.FollowerCount
+// FollowerCount returns the number of distinct followers of userID.
+func (gi *GraphIndex) FollowerCount(userID int64) int {
+	if bm, ok := gi.Followers.Load(userID); ok {
+		return int(bm.GetCardinality())
 	}
 	return 0
 }

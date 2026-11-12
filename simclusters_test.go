@@ -1,367 +1,295 @@
 package simclusters
 
 import (
-	"strings"
+	"bytes"
+	"encoding/json"
+	"math"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
-
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
-func TestEnumerateSubsets(t *testing.T) {
-	tests := []struct {
-		name             string
-		communities      []uint64
-		maxSize          int
-		expectedCount    int
-		expectedContents [][]uint64 // For small cases, we can check exact contents
-	}{
-		{
-			name:          "3 communities, max size 2",
-			communities:   []uint64{0, 1, 2},
-			maxSize:       2,
-			expectedCount: 6, // C(3,0) + C(3,1) + C(3,2) = 1 + 3 + 3 = 7
-			expectedContents: [][]uint64{
-				//{},  // empty set
-				{0}, // singles
-				{1},
-				{2},
-				{0, 1}, // pairs
-				{0, 2},
-				{1, 2},
-			},
-		},
-		{
-			name:          "4 communities, max size 2",
-			communities:   []uint64{10, 20, 30, 40},
-			maxSize:       2,
-			expectedCount: 10, // C(4,0) + C(4,1) + C(4,2) = 1 + 4 + 6 = 11
-		},
-		{
-			name:          "5 communities, max size 3",
-			communities:   []uint64{5, 10, 15, 20, 25},
-			maxSize:       3,
-			expectedCount: 25, // C(5,0) + C(5,1) + C(5,2) + C(5,3) = 1 + 5 + 10 + 10 = 26
-		},
-		{
-			name:          "2 communities, max size 4 (capped at 2)",
-			communities:   []uint64{100, 200},
-			maxSize:       4,
-			expectedCount: 3, // C(2,0) + C(2,1) + C(2,2) = 1 + 2 + 1 = 4
-		},
-		{
-			name:          "single community",
-			communities:   []uint64{42},
-			maxSize:       1,
-			expectedCount: 1, // C(1,0) + C(1,1) = 1 + 1 = 2 (empty and {42})
-		},
-		{
-			name:          "4 communities, max size 4 (all subsets)",
-			communities:   []uint64{1, 2, 3, 4},
-			maxSize:       4,
-			expectedCount: 15, // 2^4 = 16 (all possible subsets)
-		},
-	}
+const (
+	e2eGroups      = 12
+	e2ePerGroup    = 15
+	e2ePoolSize    = 400
+	e2eInfluencers = e2eGroups * e2ePerGroup
+	e2eUserBase    = 10_000
+)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var results []*roaring64.Bitmap
-			seen := make(map[string]bool) // Use string representation to detect duplicates
-
-			// Collect all subsets
-			enumerateSubsets(tt.communities, tt.maxSize, func(bm *roaring64.Bitmap) {
-				// Clone the bitmap since the callback reuses the same one
-				cloned := bm.Clone()
-				results = append(results, cloned)
-
-				// Check for duplicates using bitmap's String representation
-				key := cloned.String()
-				if seen[key] {
-					t.Errorf("Duplicate subset generated: %v", bitmapToSlice(cloned))
-				}
-				seen[key] = true
-
-				// Verify size constraint
-				size := cloned.GetCardinality()
-				if size > uint64(tt.maxSize) {
-					t.Errorf("Subset size %d exceeds maxSize %d: %v",
-						size, tt.maxSize, bitmapToSlice(cloned))
-				}
-
-				// Verify all elements are from the input communities
-				iter := cloned.Iterator()
-				for iter.HasNext() {
-					val := iter.Next()
-					found := false
-					for _, comm := range tt.communities {
-						if val == comm {
-							found = true
-							break
-						}
-					}
-					if !found {
-						t.Errorf("Subset contains element %d not in input communities", val)
-					}
-				}
-			})
-
-			// Check count
-			if len(results) != tt.expectedCount {
-				t.Errorf("Expected %d subsets, got %d", tt.expectedCount, len(results))
+// e2eFollowGraph builds a follow graph of groups of influencers (ids from 1)
+// that share an audience: every influencer is followed by 60% of its group's
+// pool of users, and every user also follows two random influencers.
+func e2eFollowGraph() []Edge {
+	r := rand.New(rand.NewSource(1))
+	var edges []Edge
+	for inf := 0; inf < e2eInfluencers; inf++ {
+		pool := e2eUserBase + (inf/e2ePerGroup)*e2ePoolSize
+		for u := 0; u < e2ePoolSize; u++ {
+			if r.Float64() < 0.6 {
+				edges = append(edges, Edge{From: int64(pool + u), To: int64(inf + 1)})
 			}
-
-			// For small test cases, verify exact contents
-			if tt.expectedContents != nil {
-				if !verifySubsetContents(t, results, tt.expectedContents) {
-					t.Errorf("Subset contents don't match expected")
-				}
-			}
-
-			t.Logf("✓ Generated %d unique subsets (expected %d)",
-				len(results), tt.expectedCount)
-		})
+		}
 	}
+	for u := 0; u < e2eGroups*e2ePoolSize; u++ {
+		for i := 0; i < 2; i++ {
+			edges = append(edges, Edge{From: int64(e2eUserBase + u), To: int64(r.Intn(e2eInfluencers) + 1)})
+		}
+	}
+	return edges
 }
 
-// Helper function to convert bitmap to sorted slice for comparison
-func bitmapToSlice(bm *roaring64.Bitmap) []uint64 {
-	result := make([]uint64, 0, bm.GetCardinality())
-	iter := bm.Iterator()
-	for iter.HasNext() {
-		result = append(result, iter.Next())
-	}
-	return result
+func e2eOptions(t *testing.T) Options {
+	opts := DefaultOptions()
+	opts.MinFollowers = 50
+	opts.NumCommunities = 2 * e2eGroups
+	opts.Epochs = 30
+	opts.Workers = 4
+	opts.OutputDir = t.TempDir()
+	return opts
 }
 
-// Helper function to verify that generated subsets match expected contents
-func verifySubsetContents(t *testing.T, results []*roaring64.Bitmap, expected [][]uint64) bool {
-	if len(results) != len(expected) {
-		t.Logf("Count mismatch: got %d, expected %d", len(results), len(expected))
+func readAssignments(t *testing.T, path string) map[int64]map[int]float64 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[int64]map[int]float64
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return out
+}
+
+func TestComputeClustersEndToEnd(t *testing.T) {
+	opts := e2eOptions(t)
+	opts.CheckpointPath = filepath.Join(t.TempDir(), "checkpoint")
+	sc, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.Graph().AddEdgesBatch(e2eFollowGraph())
+	if err := sc.ComputeClusters(); err != nil {
+		t.Fatal(err)
+	}
+
+	influencers := readAssignments(t, filepath.Join(opts.OutputDir, InfluencerCommunitiesFile))
+	if len(influencers) != e2eInfluencers {
+		t.Fatalf("%d influencers clustered, want %d", len(influencers), e2eInfluencers)
+	}
+	groupComms := make([]map[int]bool, e2eGroups)
+	for id, comms := range influencers {
+		if len(comms) < 1 || len(comms) > opts.MaxCommunitiesPerNode {
+			t.Fatalf("influencer %d is in %d communities", id, len(comms))
+		}
+		g := int(id-1) / e2ePerGroup
+		if groupComms[g] == nil {
+			groupComms[g] = make(map[int]bool)
+		}
+		for c := range comms {
+			groupComms[g][c] = true
+		}
+	}
+	share := func(a, b int64) bool {
+		for c := range influencers[a] {
+			if _, ok := influencers[b][c]; ok {
+				return true
+			}
+		}
 		return false
 	}
-
-	// Convert results to comparable format
-	resultSets := make(map[string][]uint64)
-	for _, bm := range results {
-		slice := bitmapToSlice(bm)
-		key := bm.String()
-		resultSets[key] = slice
-	}
-
-	// Convert expected to bitmaps and check
-	for _, expectedSlice := range expected {
-		bm := roaring64.New()
-		for _, val := range expectedSlice {
-			bm.Add(val)
-		}
-		key := bm.String()
-
-		if _, found := resultSets[key]; !found {
-			t.Logf("Missing expected subset: %v", expectedSlice)
-			return false
-		}
-	}
-
-	return true
-}
-
-// Test that enumerateSubsets produces consistent results
-func TestEnumerateSubsetsConsistency(t *testing.T) {
-	communities := []uint64{0, 1, 2, 3}
-	maxSize := 3
-
-	// Run enumeration twice
-	var results1, results2 []string
-
-	enumerateSubsets(communities, maxSize, func(bm *roaring64.Bitmap) {
-		results1 = append(results1, bm.Clone().String())
-	})
-
-	enumerateSubsets(communities, maxSize, func(bm *roaring64.Bitmap) {
-		results2 = append(results2, bm.Clone().String())
-	})
-
-	// Results should be identical (same order)
-	if len(results1) != len(results2) {
-		t.Errorf("Inconsistent number of results: %d vs %d", len(results1), len(results2))
-	}
-
-	for i := 0; i < len(results1) && i < len(results2); i++ {
-		if results1[i] != results2[i] {
-			t.Errorf("Inconsistent result at index %d: %s vs %s", i, results1[i], results2[i])
-		}
-	}
-}
-
-// TestHighFollowerEdgeDistribution analyzes edge cosine similarity for users with high follower counts
-func TestHighFollowerEdgeDistribution(t *testing.T) {
-	t.Skip()
-	checkpointPath := "checkpoint-big5"
-	minFollowerThreshold := int32(100000) // Analyze users with 100k+ followers
-
-	t.Logf("Loading checkpoint from %s...", checkpointPath)
-	state, err := LoadCheckpoint(checkpointPath)
-	if err != nil {
-		t.Skipf("Checkpoint not found, skipping: %v", err)
-	}
-
-	t.Logf("Loaded checkpoint with %d influencers, %d edges",
-		len(state.Influencers), len(state.InfluencerMatrix))
-
-	// Find high-follower users
-	highFollowerUsers := make(map[int64]int32)
-	for _, userID := range state.Influencers {
-		user := state.GraphIndex.Users[userID]
-		if user != nil && user.FollowerCount >= minFollowerThreshold {
-			highFollowerUsers[userID] = user.FollowerCount
-		}
-	}
-
-	t.Logf("Found %d users with >= %d followers", len(highFollowerUsers), minFollowerThreshold)
-
-	if len(highFollowerUsers) == 0 {
-		t.Skip("No high-follower users found")
-	}
-
-	// Analyze edges for these users
-	type EdgeStats struct {
-		UserID        int64
-		FollowerCount int32
-		TotalEdges    int
-		EdgesUnder01  int
-		EdgesUnder015 int
-		EdgesUnder02  int
-		Edges02to03   int
-		EdgesOver03   int
-		MinSimilarity float64
-		MaxSimilarity float64
-		AvgSimilarity float64
-		SimilaritySum float64
-	}
-
-	userStats := make(map[int64]*EdgeStats)
-	for userID, followerCount := range highFollowerUsers {
-		userStats[userID] = &EdgeStats{
-			UserID:        userID,
-			FollowerCount: followerCount,
-			MinSimilarity: 1.0,
-			MaxSimilarity: 0.0,
-		}
-	}
-
-	// Scan all edges involving high-follower users
-	for edge, similarity := range state.InfluencerMatrix {
-		var stats *EdgeStats
-		var ok bool
-
-		// Check if either end is a high-follower user
-		if stats, ok = userStats[edge.A]; ok {
-			// edge.A is a high-follower user
-		} else if stats, ok = userStats[edge.B]; ok {
-			// edge.B is a high-follower user
-		} else {
-			continue // Neither end is a high-follower user
-		}
-
-		stats.TotalEdges++
-		stats.SimilaritySum += similarity
-
-		if similarity < stats.MinSimilarity {
-			stats.MinSimilarity = similarity
-		}
-		if similarity > stats.MaxSimilarity {
-			stats.MaxSimilarity = similarity
-		}
-
-		// Categorize by similarity threshold
-		if similarity < 0.1 {
-			stats.EdgesUnder01++
-		} else if similarity < 0.15 {
-			stats.EdgesUnder015++
-		} else if similarity < 0.2 {
-			stats.EdgesUnder02++
-		} else if similarity < 0.3 {
-			stats.Edges02to03++
-		} else {
-			stats.EdgesOver03++
-		}
-	}
-
-	// Calculate averages and print statistics
-	t.Logf("\n=== High-Follower User Edge Statistics ===")
-	t.Logf("%-12s %-12s %-10s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s",
-		"UserID", "Followers", "TotEdges", "<0.10", "0.10-0.15", "0.15-0.20", "0.20-0.30", ">0.30", "Min", "Max", "Avg")
-	t.Logf("%s", strings.Repeat("-", 120))
-
-	// Sort by follower count for readability
-	sortedUsers := make([]*EdgeStats, 0, len(userStats))
-	for _, stats := range userStats {
-		if stats.TotalEdges > 0 {
-			stats.AvgSimilarity = stats.SimilaritySum / float64(stats.TotalEdges)
-			sortedUsers = append(sortedUsers, stats)
-		}
-	}
-
-	// Sort by follower count descending
-	for i := 0; i < len(sortedUsers); i++ {
-		for j := i + 1; j < len(sortedUsers); j++ {
-			if sortedUsers[i].FollowerCount < sortedUsers[j].FollowerCount {
-				sortedUsers[i], sortedUsers[j] = sortedUsers[j], sortedUsers[i]
+	var same, sameShared, cross, crossShared int
+	for a := int64(1); a <= e2eInfluencers; a++ {
+		for b := a + 1; b <= e2eInfluencers; b++ {
+			if (a-1)/e2ePerGroup == (b-1)/e2ePerGroup {
+				same++
+				if share(a, b) {
+					sameShared++
+				}
+			} else {
+				cross++
+				if share(a, b) {
+					crossShared++
+				}
 			}
 		}
 	}
-
-	// Print stats
-	for _, stats := range sortedUsers {
-		t.Logf("%-12d %-12d %-10d %-8d %-8d %-8d %-8d %-8d %-8.4f %-8.4f %-8.4f",
-			stats.UserID,
-			stats.FollowerCount,
-			stats.TotalEdges,
-			stats.EdgesUnder01,
-			stats.EdgesUnder015,
-			stats.EdgesUnder02,
-			stats.Edges02to03,
-			stats.EdgesOver03,
-			stats.MinSimilarity,
-			stats.MaxSimilarity,
-			stats.AvgSimilarity)
+	if float64(sameShared) < 0.9*float64(same) || float64(crossShared) > 0.05*float64(cross) {
+		t.Errorf("influencers sharing a community: %d/%d within groups, %d/%d across groups", sameShared, same, crossShared, cross)
 	}
 
-	// Aggregate statistics
-	t.Logf("\n=== Aggregate Statistics ===")
-	var totalEdges, totalUnder01, totalUnder015, totalUnder02, total02to03, totalOver03 int
-	var totalUsers, usersWithNoEdges, usersLostAt02Threshold int
-
-	for _, stats := range userStats {
-		totalUsers++
-		if stats.TotalEdges == 0 {
-			usersWithNoEdges++
-			continue
+	users := readAssignments(t, filepath.Join(opts.OutputDir, MappingFile))
+	if want := e2eGroups * e2ePoolSize; len(users) != want {
+		t.Fatalf("%d users mapped, want %d", len(users), want)
+	}
+	topInOwnGroup := 0
+	for id, comms := range users {
+		if len(comms) < 1 || len(comms) > opts.TopInterests {
+			t.Fatalf("user %d has %d communities", id, len(comms))
 		}
-
-		totalEdges += stats.TotalEdges
-		totalUnder01 += stats.EdgesUnder01
-		totalUnder015 += stats.EdgesUnder015
-		totalUnder02 += stats.EdgesUnder02
-		total02to03 += stats.Edges02to03
-		totalOver03 += stats.EdgesOver03
-
-		// Check if user would be isolated at 0.2 threshold
-		edgesAt02OrAbove := stats.Edges02to03 + stats.EdgesOver03
-		if edgesAt02OrAbove == 0 {
-			usersLostAt02Threshold++
+		top, best, sum := -1, 0.0, 0.0
+		for c, score := range comms {
+			sum += score
+			if score > best || (score == best && c < top) {
+				top, best = c, score
+			}
+		}
+		if sum > 1+1e-9 {
+			t.Fatalf("user %d scores sum to %v", id, sum)
+		}
+		if groupComms[int(id-e2eUserBase)/e2ePoolSize][top] {
+			topInOwnGroup++
 		}
 	}
+	if float64(topInOwnGroup) < 0.95*float64(len(users)) {
+		t.Errorf("only %d/%d users have a top community from their own group", topInOwnGroup, len(users))
+	}
 
-	t.Logf("Total high-follower users: %d", totalUsers)
-	t.Logf("Users with no edges at all: %d (%.1f%%)", usersWithNoEdges, 100.0*float64(usersWithNoEdges)/float64(totalUsers))
-	t.Logf("Users lost at 0.2 threshold: %d (%.1f%%)", usersLostAt02Threshold, 100.0*float64(usersLostAt02Threshold)/float64(totalUsers))
-	t.Logf("\nTotal edges: %d", totalEdges)
-	t.Logf("Edges < 0.10: %d (%.1f%%)", totalUnder01, 100.0*float64(totalUnder01)/float64(totalEdges))
-	t.Logf("Edges 0.10-0.15: %d (%.1f%%)", totalUnder015, 100.0*float64(totalUnder015)/float64(totalEdges))
-	t.Logf("Edges 0.15-0.20: %d (%.1f%%)", totalUnder02, 100.0*float64(totalUnder02)/float64(totalEdges))
-	t.Logf("Edges 0.20-0.30: %d (%.1f%%)", total02to03, 100.0*float64(total02to03)/float64(totalEdges))
-	t.Logf("Edges > 0.30: %d (%.1f%%)", totalOver03, 100.0*float64(totalOver03)/float64(totalEdges))
+	// Resuming from the checkpoint and changing the worker count must both
+	// reproduce the fresh run exactly.
+	fresh := readOutputs(t, opts.OutputDir)
 
-	edgesLostAt02 := totalUnder01 + totalUnder015 + totalUnder02
-	t.Logf("\nEdges lost at 0.2 threshold: %d (%.1f%%)", edgesLostAt02, 100.0*float64(edgesLostAt02)/float64(totalEdges))
+	resumeOpts := e2eOptions(t)
+	resumed, err := New(resumeOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resumed.ComputeClustersFromCheckpoint(opts.CheckpointPath); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.EqualFunc(fresh, readOutputs(t, resumeOpts.OutputDir), bytes.Equal) {
+		t.Error("resuming from the checkpoint gave different output than the fresh run")
+	}
+
+	serialOpts := e2eOptions(t)
+	serialOpts.Workers = 1
+	serial, err := New(serialOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial.Graph().AddEdgesBatch(e2eFollowGraph())
+	if err := serial.ComputeClusters(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.EqualFunc(fresh, readOutputs(t, serialOpts.OutputDir), bytes.Equal) {
+		t.Error("a different worker count gave different output")
+	}
+}
+
+func readOutputs(t *testing.T, dir string) [][]byte {
+	t.Helper()
+	var out [][]byte
+	for _, name := range []string{InfluencerCommunitiesFile, MappingFile} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, data)
+	}
+	return out
+}
+
+func TestResumeRejectsCheckpointWithHigherFloor(t *testing.T) {
+	opts := e2eOptions(t)
+	opts.MinSimilarity = 0.4 // and so is the checkpoint's floor
+	opts.CheckpointPath = filepath.Join(t.TempDir(), "checkpoint")
+	sc, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.Graph().AddEdgesBatch(e2eFollowGraph())
+	if err := sc.ComputeClusters(); err != nil {
+		t.Fatal(err)
+	}
+
+	resumeOpts := e2eOptions(t) // MinSimilarity 0.2, below the checkpoint's floor
+	resumed, err := New(resumeOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resumed.ComputeClustersFromCheckpoint(opts.CheckpointPath); err == nil {
+		t.Error("resuming with MinSimilarity below the checkpoint's floor succeeded")
+	}
+}
+
+func TestComputeClustersWithoutInfluencers(t *testing.T) {
+	opts := e2eOptions(t)
+	sc, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.ComputeClusters(); err == nil {
+		t.Error("empty graph: expected an error")
+	}
+
+	sc.Graph().AddEdgesBatch([]Edge{{From: 1, To: 2}, {From: 3, To: 2}})
+	if err := sc.ComputeClusters(); err == nil {
+		t.Error("graph without influencers: expected an error")
+	}
+	for _, name := range []string{InfluencerCommunitiesFile, MappingFile} {
+		if _, err := os.Stat(filepath.Join(opts.OutputDir, name)); err == nil {
+			t.Errorf("%s was written by a failed run", name)
+		}
+	}
+}
+
+func TestIdentifyInfluencers(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MinFollowers = 3
+	sc, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// User 1 has 4 followers, user 2 has 3, user 3 has 2; users 10..13 have
+	// none. Of these 7 users the 90th percentile is 4 followers, which is
+	// above MinFollowers and so sets the cut.
+	var edges []Edge
+	for f := int64(10); f < 14; f++ {
+		edges = append(edges, Edge{From: f, To: 1}, Edge{From: f, To: 1}) // duplicates count once
+		if f < 13 {
+			edges = append(edges, Edge{From: f, To: 2})
+		}
+		if f < 12 {
+			edges = append(edges, Edge{From: f, To: 3})
+		}
+	}
+	sc.Graph().AddEdgesBatch(edges)
+	if got := sc.identifyInfluencers(); !slices.Equal(got, []int64{1}) {
+		t.Errorf("influencers = %v, want [1]", got)
+	}
+
+	// With 40 more users that have no followers the 90th percentile drops
+	// to zero and MinFollowers decides.
+	edges = edges[:0]
+	for f := int64(100); f < 140; f++ {
+		edges = append(edges, Edge{From: f, To: 50})
+	}
+	sc.Graph().AddEdgesBatch(edges)
+	if got := sc.identifyInfluencers(); !slices.Equal(got, []int64{1, 2, 50}) {
+		t.Errorf("influencers = %v, want [1 2 50]", got)
+	}
+}
+
+func TestOptionsValidate(t *testing.T) {
+	if _, err := New(DefaultOptions()); err != nil {
+		t.Fatalf("default options rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Options){
+		"floor above min similarity": func(o *Options) { o.SimilarityFloor = o.MinSimilarity * 2 },
+		"too many per node":          func(o *Options) { o.MaxCommunitiesPerNode, o.MaxCandidates = maxCandidateLimit, maxCandidateLimit },
+		"no room for a candidate":    func(o *Options) { o.MaxCandidates = o.MaxCommunitiesPerNode },
+		"no communities":             func(o *Options) { o.NumCommunities = 0 },
+		"zero temperature":           func(o *Options) { o.Temperature = 0 },
+		"NaN alpha":                  func(o *Options) { o.Alpha = math.NaN() },
+		"infinite temperature":       func(o *Options) { o.Temperature = math.Inf(1) },
+	} {
+		opts := DefaultOptions()
+		mutate(&opts)
+		if _, err := New(opts); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
 }

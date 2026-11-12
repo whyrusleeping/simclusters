@@ -1,0 +1,33 @@
+# Binaries
+/simmy
+goros
+check_duplicates
+
+# Checkpoints
+checkpoint-*/
+
+# Input data
+follows*.csv
+follows-data/
+follows-data2/
+
+# Output files
+communities.csv
+influencer_communities.json
+mapping.json
+mapping-*.json
+
+# Experiments
+cuda/
+cudam/
+
+# Profiling and debugging
+cpu.svg
+*.pprof
+
+# PDFs and docs
+*.pdf
+
+# Test artifacts
+stats
+*.test

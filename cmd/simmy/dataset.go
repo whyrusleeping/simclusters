@@ -9,8 +9,6 @@ import (
 
 	"github.com/schollz/progressbar/v3"
 	"github.com/urfave/cli/v3"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 )
 
 var buildDatasetCmd = &cli.Command{
@@ -42,16 +40,9 @@ func runBuildDataset(ctx context.Context, cmd *cli.Command) error {
 	authorActiveDays := cmd.Int("author-active-days")
 	subjectActiveDays := cmd.Int("subject-active-days")
 
-	// Connect to database
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		return fmt.Errorf("DATABASE_URL environment variable not set")
-	}
-
-	fmt.Println("Connecting to database...")
-	db, err := gorm.Open(postgres.Open(dbURL), &gorm.Config{})
+	db, err := openDatabase(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return err
 	}
 
 	// Calculate cutoff timestamps
@@ -119,7 +110,7 @@ func runBuildDataset(ctx context.Context, cmd *cli.Command) error {
 	for rows.Next() {
 		var followID int64
 		var author int64
-		var subject string
+		var subject int64
 
 		if err := rows.Scan(&followID, &author, &subject); err != nil {
 			return fmt.Errorf("failed to scan row: %w", err)
@@ -128,7 +119,7 @@ func runBuildDataset(ctx context.Context, cmd *cli.Command) error {
 		if err := writer.Write([]string{
 			fmt.Sprintf("%d", followID),
 			fmt.Sprintf("%d", author),
-			subject,
+			fmt.Sprintf("%d", subject),
 		}); err != nil {
 			return fmt.Errorf("failed to write CSV row: %w", err)
 		}
