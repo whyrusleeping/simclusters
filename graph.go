@@ -1,8 +1,8 @@
 package simclusters
 
 import (
-	"slices"
 	"sort"
+	"sync/atomic"
 )
 
 // simGraph is the undirected influencer similarity graph in CSR form. Nodes
@@ -24,67 +24,63 @@ func (g *simGraph) neighbors(u int32) ([]int32, []float32) {
 	return g.nbr[s:e], g.w[s:e]
 }
 
-// newSimGraph builds the graph from edges with Weight >= minWeight. If
-// maxNeighbors is positive the graph is then sparsified: an edge is kept only
-// if it is among the maxNeighbors strongest edges of at least one of its
-// endpoints (edges tied with the weakest of those are kept too). Nodes left
-// without an edge are not part of the graph.
-func newSimGraph(edges []SimEdge, minWeight float64, maxNeighbors, workers int) *simGraph {
-	keep := func(e SimEdge) bool { return e.Weight >= minWeight && e.A != e.B }
-
-	index := make(map[int64]int32)
-	for _, e := range edges {
-		if keep(e) {
-			index[e.A] = 0
-			index[e.B] = 0
-		}
-	}
-	ids := make([]int64, 0, len(index))
-	for id := range index {
-		ids = append(ids, id)
-	}
-	slices.Sort(ids)
-	for i, id := range ids {
-		index[id] = int32(i)
-	}
-
-	// Endpoints as dense indices; -1 marks an edge that is not kept.
-	ends := make([]int32, 2*len(edges))
-	parallelRange(len(edges), workers, 1<<16, func(_, lo, hi int) {
+// newSimGraph builds the graph from the matrix entries with weight >=
+// minWeight. If maxNeighbors is positive the graph is then sparsified: an
+// edge is kept only if it is among the maxNeighbors strongest edges of at
+// least one of its endpoints (edges tied with the weakest of those are kept
+// too). Influencers left without an edge are not part of the graph.
+func newSimGraph(m *simMatrix, minWeight float64, maxNeighbors, workers int) *simGraph {
+	numInf := len(m.ids)
+	deg := make([]int64, numInf)
+	parallelRange(numInf, workers, 64, func(_, lo, hi int) {
 		for i := lo; i < hi; i++ {
-			if e := edges[i]; keep(e) {
-				ends[2*i], ends[2*i+1] = index[e.A], index[e.B]
-			} else {
-				ends[2*i] = -1
+			for k, j := range m.cols[i] {
+				if m.ws[i][k] >= minWeight {
+					atomic.AddInt64(&deg[i], 1)
+					atomic.AddInt64(&deg[j], 1)
+				}
 			}
 		}
 	})
 
+	// Nodes are the influencers with an edge, in influencer order.
+	node := make([]int32, numInf)
+	var ids []int64
+	for i, d := range deg {
+		node[i] = -1
+		if d > 0 {
+			node[i] = int32(len(ids))
+			ids = append(ids, m.ids[i])
+		}
+	}
 	n := len(ids)
 	off := make([]int64, n+1)
-	for i := range edges {
-		if a := ends[2*i]; a >= 0 {
-			off[a+1]++
-			off[ends[2*i+1]+1]++
+	for i, d := range deg {
+		if node[i] >= 0 {
+			off[node[i]+1] = off[node[i]] + d
 		}
 	}
-	for i := 0; i < n; i++ {
-		off[i+1] += off[i]
-	}
+	cursor := make([]int64, n)
+	copy(cursor, off[:n])
 	nbr := make([]int32, off[n])
 	w := make([]float32, off[n])
-	cursor := slices.Clone(off[:n])
-	for i, e := range edges {
-		a := ends[2*i]
-		if a < 0 {
-			continue
+	parallelRange(numInf, workers, 64, func(_, lo, hi int) {
+		for i := lo; i < hi; i++ {
+			a := node[i]
+			for k, j := range m.cols[i] {
+				if m.ws[i][k] < minWeight {
+					continue
+				}
+				b, wt := node[j], float32(m.ws[i][k])
+				p := atomic.AddInt64(&cursor[a], 1) - 1
+				nbr[p], w[p] = b, wt
+				p = atomic.AddInt64(&cursor[b], 1) - 1
+				nbr[p], w[p] = a, wt
+			}
 		}
-		b := ends[2*i+1]
-		nbr[cursor[a]], w[cursor[a]] = b, float32(e.Weight)
-		cursor[a]++
-		nbr[cursor[b]], w[cursor[b]] = a, float32(e.Weight)
-		cursor[b]++
-	}
+	})
+	// Fill order varies between runs; sorting by (weight, neighbour) makes
+	// every row deterministic.
 	parallelRange(n, workers, 64, func(_, lo, hi int) {
 		for u := lo; u < hi; u++ {
 			sort.Sort(byWeightDesc{nbr[off[u]:off[u+1]], w[off[u]:off[u+1]]})
@@ -99,21 +95,36 @@ func newSimGraph(edges []SimEdge, minWeight float64, maxNeighbors, workers int) 
 				weakest[u] = row[maxNeighbors-1]
 			}
 		}
-		// Compact the rows in place; the test is symmetric, so both
-		// directions of an edge survive or go together.
-		var out int64
-		for u := 0; u < n; u++ {
-			start, end := off[u], off[u+1]
-			off[u] = out
-			for i := start; i < end; i++ {
-				if w[i] >= weakest[u] || w[i] >= weakest[nbr[i]] {
-					nbr[out], w[out] = nbr[i], w[i]
-					out++
+		// The test is symmetric, so both directions of an edge survive or
+		// go together.
+		keep := func(u int, i int64) bool { return w[i] >= weakest[u] || w[i] >= weakest[nbr[i]] }
+		kept := make([]int64, n+1)
+		parallelRange(n, workers, 256, func(_, lo, hi int) {
+			for u := lo; u < hi; u++ {
+				for i := off[u]; i < off[u+1]; i++ {
+					if keep(u, i) {
+						kept[u+1]++
+					}
 				}
 			}
+		})
+		for u := 0; u < n; u++ {
+			kept[u+1] += kept[u]
 		}
-		off[n] = out
-		nbr, w = nbr[:out], w[:out]
+		sparseNbr := make([]int32, kept[n])
+		sparseW := make([]float32, kept[n])
+		parallelRange(n, workers, 256, func(_, lo, hi int) {
+			for u := lo; u < hi; u++ {
+				out := kept[u]
+				for i := off[u]; i < off[u+1]; i++ {
+					if keep(u, i) {
+						sparseNbr[out], sparseW[out] = nbr[i], w[i]
+						out++
+					}
+				}
+			}
+		})
+		off, nbr, w = kept, sparseNbr, sparseW
 	}
 
 	g := &simGraph{ids: ids, off: off, nbr: nbr, w: w, numEdges: len(nbr) / 2, rowW: make([]float64, n)}

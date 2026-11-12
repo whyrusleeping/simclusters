@@ -38,7 +38,7 @@ Build a filtered CSV from active accounts in PostgreSQL:
 
 Main flags:
 
-- `--checkpoint` saves the follow and similarity graphs; `--from-checkpoint` loads them instead of CSV input.
+- `--checkpoint` saves the follow and similarity graphs; `--from-checkpoint` loads them instead of CSV input. Checkpoints from older versions (format 1 or 2) cannot be loaded; rerun from the CSV input to rebuild them.
 - `--out-dir` chooses where the result files are written (default: current directory).
 - `--min-similarity` sets the lowest similarity used for clustering (default: 0.2). Influencers with no edge at or above it are left unclustered; the run logs how many.
 - `--similarity-floor` stores similarities down to this value in the checkpoint, so a resumed run can lower `--min-similarity` without recomputing them (default: the `--min-similarity` value).

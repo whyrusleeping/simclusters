@@ -20,7 +20,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -170,14 +169,14 @@ func (sc *SimClusters) ComputeClusters() error {
 	}
 
 	bar := sc.progressBar(len(influencers), "similarity")
-	edges := buildSimilarityEdges(sc.graph, influencers, sc.opts.SimilarityFloor, sc.opts.Workers,
+	sim := buildSimilarity(sc.graph, influencers, sc.opts.SimilarityFloor, sc.opts.Workers,
 		func(done int) { bar.Add(done) })
 	bar.Finish()
 
 	if sc.opts.CheckpointPath != "" {
 		state := &CheckpointState{
 			Influencers:     influencers,
-			Edges:           edges,
+			sim:             sim,
 			SimilarityFloor: sc.opts.SimilarityFloor,
 			GraphIndex:      sc.graph,
 		}
@@ -185,13 +184,13 @@ func (sc *SimClusters) ComputeClusters() error {
 			return fmt.Errorf("saving checkpoint: %w", err)
 		}
 	}
-	return sc.cluster(influencers, edges)
+	return sc.cluster(influencers, sim)
 }
 
 // ComputeClustersFromCheckpoint skips ingestion and the similarity stage by
 // loading their results from a checkpoint written by an earlier run.
 func (sc *SimClusters) ComputeClustersFromCheckpoint(path string) error {
-	state, err := LoadCheckpoint(path, LoadOptions{})
+	state, err := LoadCheckpoint(path)
 	if err != nil {
 		return fmt.Errorf("loading checkpoint: %w", err)
 	}
@@ -200,53 +199,30 @@ func (sc *SimClusters) ComputeClustersFromCheckpoint(path string) error {
 			state.SimilarityFloor, sc.opts.MinSimilarity)
 	}
 	sc.graph = state.GraphIndex
-	return sc.cluster(state.Influencers, state.Edges)
+	return sc.cluster(state.Influencers, state.sim)
 }
 
 // identifyInfluencers returns the users whose follower count reaches both
 // MinFollowers and the 90th percentile over all users, sorted by id.
 func (sc *SimClusters) identifyInfluencers() []int64 {
-	type user struct {
-		id        int64
-		followers int
-	}
-	var followed []user
-	sc.graph.Followers.Range(func(id int64, bm *roaring64.Bitmap) bool {
-		followed = append(followed, user{id, int(bm.GetCardinality())})
-		return true
-	})
-	// Users that follow others but have no followers themselves still count
-	// towards the percentile.
-	unfollowed := 0
-	sc.graph.Following.Range(func(id int64, _ *roaring64.Bitmap) bool {
-		if _, ok := sc.graph.Followers.Load(id); !ok {
-			unfollowed++
-		}
-		return true
-	})
-	if len(followed) == 0 {
+	gi := sc.graph
+	gi.build(sc.opts.Workers)
+	numUsers := len(gi.ids)
+	if numUsers == 0 {
 		return nil
 	}
-
-	counts := make([]int, len(followed))
-	for i, u := range followed {
-		counts[i] = u.followers
-	}
+	// Users without followers count towards the percentile too.
+	counts := slices.Clone(gi.inDeg)
 	slices.Sort(counts)
-	numUsers := len(followed) + unfollowed
-	p90 := 0
-	if i := numUsers*9/10 - unfollowed; i >= 0 {
-		p90 = counts[i]
-	}
+	p90 := int(counts[numUsers*9/10])
 	threshold := max(p90, sc.opts.MinFollowers)
 
 	var influencers []int64
-	for _, u := range followed {
-		if u.followers >= threshold {
-			influencers = append(influencers, u.id)
+	for u, followers := range gi.inDeg {
+		if int(followers) >= threshold {
+			influencers = append(influencers, gi.ids[u])
 		}
 	}
-	slices.Sort(influencers)
 	slog.Info("influencers identified",
 		"users", numUsers, "influencers", len(influencers),
 		"follower_threshold", threshold, "p90_followers", p90)
@@ -255,9 +231,9 @@ func (sc *SimClusters) identifyInfluencers() []int64 {
 
 // cluster runs community detection on the similarity graph and writes the
 // influencer and user community files.
-func (sc *SimClusters) cluster(influencers []int64, edges []SimEdge) error {
+func (sc *SimClusters) cluster(influencers []int64, sim *simMatrix) error {
 	o := &sc.opts
-	g := newSimGraph(edges, o.MinSimilarity, o.MaxNeighbors, o.Workers)
+	g := newSimGraph(sim, o.MinSimilarity, o.MaxNeighbors, o.Workers)
 	n := g.numNodes()
 	if n == 0 {
 		return fmt.Errorf("no influencer pair has similarity >= %g; nothing to cluster", o.MinSimilarity)

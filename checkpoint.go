@@ -2,46 +2,53 @@ package simclusters
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sync"
+	"slices"
+	"sync/atomic"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
-	smap "github.com/zolstein/sync-map"
 	"golang.org/x/sync/errgroup"
 )
 
-const checkpointVersion = 2
+const checkpointVersion = 3
 const checkpointBufferSize = 256 * 1024
-const checkpointMaxBitmapSize = 100 * 1024 * 1024
 
 // CheckpointState represents the state to be saved/loaded.
 type CheckpointState struct {
 	Influencers []int64
-	// Edges is the influencer similarity graph: all pairs with similarity
-	// of at least SimilarityFloor.
-	Edges           []SimEdge
+	// sim is the influencer similarity graph: all pairs with similarity of
+	// at least SimilarityFloor. Nil means no pairs.
+	sim             *simMatrix
 	SimilarityFloor float64
-	// GraphIndex holds the follow graph. Followers is only populated on
-	// load when LoadOptions.Followers is set.
+	// GraphIndex holds the follow graph.
 	GraphIndex *GraphIndex
 }
 
-// LoadOptions selects optional parts of a checkpoint to load.
-type LoadOptions struct {
-	// Followers loads the follower direction, which resuming does not need.
-	Followers bool
+// NumSimilarityEdges returns the number of influencer pairs in the similarity
+// graph.
+func (s *CheckpointState) NumSimilarityEdges() int {
+	if s.sim == nil {
+		return 0
+	}
+	return s.sim.numEdges()
+}
+
+// SimilarityEdges yields the similarity graph's edges ordered by (A, B).
+func (s *CheckpointState) SimilarityEdges() iter.Seq[SimEdge] {
+	if s.sim == nil {
+		return func(func(SimEdge) bool) {}
+	}
+	return s.sim.edges()
 }
 
 // CheckpointMetadata stores metadata about the checkpoint.
@@ -51,10 +58,20 @@ type CheckpointMetadata struct {
 	NumInfluencers  int     `json:"num_influencers"`
 	NumUsers        int     `json:"num_users"`
 	NumMatrixEdges  int     `json:"num_matrix_edges"`
-	NumFollowing    int     `json:"num_following"`
-	NumFollowers    int     `json:"num_followers"`
+	NumFollowEdges  int     `json:"num_follow_edges"`
 	SimilarityFloor float64 `json:"similarity_floor"`
 }
+
+// Checkpoint files. Every file is little-endian; a section is a uint64 count
+// followed by that many fixed-width records.
+//
+//	influencers.bin  int64 ids
+//	matrix.bin       (A int64, B int64, weight float64), ordered by (A, B), A < B
+//	users.bin        int64 ids, ascending; a user's position is its index
+//	following.bin    a section of uint32 out-degrees, one per user, then a
+//	                 section of uint32 followed-user indices, row after row,
+//	                 each row ascending
+var checkpointFiles = []string{"metadata.json", "influencers.bin", "matrix.bin", "users.bin", "following.bin"}
 
 // SaveCheckpoint saves a quiescent graph. Saves to the same directory must not
 // overlap. metadata.json is the commit marker: invalidate it durably before
@@ -74,36 +91,27 @@ func SaveCheckpoint(dirPath string, state *CheckpointState) error {
 	if state == nil || state.GraphIndex == nil {
 		return fmt.Errorf("checkpoint: nil state or GraphIndex")
 	}
+	gi := state.GraphIndex
+	gi.build(runtime.GOMAXPROCS(0))
 	metadata := CheckpointMetadata{
 		Version: checkpointVersion, Timestamp: time.Now().Unix(),
-		NumInfluencers: len(state.Influencers), NumMatrixEdges: len(state.Edges),
+		NumInfluencers: len(state.Influencers), NumMatrixEdges: state.NumSimilarityEdges(),
+		NumUsers: len(gi.ids), NumFollowEdges: len(gi.adj),
 		SimilarityFloor: state.SimilarityFloor,
 	}
-	state.GraphIndex.Following.Range(func(id int64, _ *roaring64.Bitmap) bool {
-		metadata.NumFollowing++
-		if _, ok := state.GraphIndex.Followers.Load(id); !ok {
-			metadata.NumUsers++
-		}
-		return true
-	})
-	state.GraphIndex.Followers.Range(func(_ int64, _ *roaring64.Bitmap) bool {
-		metadata.NumFollowers++
-		metadata.NumUsers++
-		return true
-	})
 	slog.Info("Saving checkpoint", "path", dirPath, "influencers", metadata.NumInfluencers,
-		"edges", metadata.NumMatrixEdges, "following", metadata.NumFollowing, "followers", metadata.NumFollowers)
+		"edges", metadata.NumMatrixEdges, "users", metadata.NumUsers, "follows", metadata.NumFollowEdges)
+	putInt64 := func(b []byte, v int64) { binary.LittleEndian.PutUint64(b, uint64(v)) }
+	putUint32 := func(b []byte, v uint32) { binary.LittleEndian.PutUint32(b, v) }
 	var g errgroup.Group
 	g.Go(func() error {
 		return writeCheckpointFile(filepath.Join(dirPath, "influencers.bin"), func(w io.Writer) error {
-			return writeCheckpointRecords(w, state.Influencers, 8, func(b []byte, id int64) {
-				binary.LittleEndian.PutUint64(b, uint64(id))
-			})
+			return writeCheckpointSection(w, metadata.NumInfluencers, slices.Values(state.Influencers), 8, putInt64)
 		})
 	})
 	g.Go(func() error {
 		return writeCheckpointFile(filepath.Join(dirPath, "matrix.bin"), func(w io.Writer) error {
-			return writeCheckpointRecords(w, state.Edges, 24, func(b []byte, e SimEdge) {
+			return writeCheckpointSection(w, metadata.NumMatrixEdges, state.SimilarityEdges(), 24, func(b []byte, e SimEdge) {
 				binary.LittleEndian.PutUint64(b, uint64(e.A))
 				binary.LittleEndian.PutUint64(b[8:], uint64(e.B))
 				binary.LittleEndian.PutUint64(b[16:], math.Float64bits(e.Weight))
@@ -111,13 +119,23 @@ func SaveCheckpoint(dirPath string, state *CheckpointState) error {
 		})
 	})
 	g.Go(func() error {
-		return writeCheckpointFile(filepath.Join(dirPath, "following.bin"), func(w io.Writer) error {
-			return writeCheckpointBitmaps(w, &state.GraphIndex.Following, metadata.NumFollowing)
+		return writeCheckpointFile(filepath.Join(dirPath, "users.bin"), func(w io.Writer) error {
+			return writeCheckpointSection(w, metadata.NumUsers, slices.Values(gi.ids), 8, putInt64)
 		})
 	})
 	g.Go(func() error {
-		return writeCheckpointFile(filepath.Join(dirPath, "followers.bin"), func(w io.Writer) error {
-			return writeCheckpointBitmaps(w, &state.GraphIndex.Followers, metadata.NumFollowers)
+		return writeCheckpointFile(filepath.Join(dirPath, "following.bin"), func(w io.Writer) error {
+			degrees := func(yield func(uint32) bool) {
+				for u := range gi.ids {
+					if !yield(uint32(gi.off[u+1] - gi.off[u])) {
+						return
+					}
+				}
+			}
+			if err := writeCheckpointSection(w, metadata.NumUsers, degrees, 4, putUint32); err != nil {
+				return err
+			}
+			return writeCheckpointSection(w, metadata.NumFollowEdges, slices.Values(gi.adj), 4, putUint32)
 		})
 	})
 	if err := g.Wait(); err != nil {
@@ -137,15 +155,13 @@ func SaveCheckpoint(dirPath string, state *CheckpointState) error {
 		syncErr := syncCheckpointDir(dirPath)
 		return fmt.Errorf("metadata.json: committing: %w", errors.Join(err, removeErr, syncErr))
 	}
-	slog.Info("Checkpoint saved", "path", dirPath, "influencers", metadata.NumInfluencers,
-		"edges", metadata.NumMatrixEdges, "following", metadata.NumFollowing, "followers", metadata.NumFollowers,
-		"size_bytes", checkpointSize(dirPath, true), "duration", time.Since(start))
+	slog.Info("Checkpoint saved", "path", dirPath, "size_bytes", checkpointSize(dirPath),
+		"duration", time.Since(start))
 	return nil
 }
 
-// LoadCheckpoint loads and validates a committed checkpoint. Version 1's extra
-// users.bin is deliberately ignored. Followers is never opened unless requested.
-func LoadCheckpoint(dirPath string, opts LoadOptions) (*CheckpointState, error) {
+// LoadCheckpoint loads and validates a committed checkpoint.
+func LoadCheckpoint(dirPath string) (*CheckpointState, error) {
 	start := time.Now()
 	data, err := os.ReadFile(filepath.Join(dirPath, "metadata.json"))
 	if err != nil {
@@ -155,50 +171,112 @@ func LoadCheckpoint(dirPath string, opts LoadOptions) (*CheckpointState, error) 
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("metadata.json: %w", err)
 	}
-	if m.Version != 1 && m.Version != checkpointVersion {
-		return nil, fmt.Errorf("metadata.json: unsupported checkpoint version %d", m.Version)
+	if m.Version != checkpointVersion {
+		return nil, fmt.Errorf("metadata.json: unsupported checkpoint version %d (want %d); rerun from the CSV input to rebuild it",
+			m.Version, checkpointVersion)
 	}
-	if m.NumInfluencers < 0 || m.NumMatrixEdges < 0 || m.NumFollowing < 0 || m.NumFollowers < 0 || m.NumUsers < 0 {
+	if m.NumInfluencers < 0 || m.NumMatrixEdges < 0 || m.NumUsers < 0 || m.NumFollowEdges < 0 {
 		return nil, fmt.Errorf("metadata.json: negative record count")
 	}
-	if m.Version == 1 {
-		// Version 1 did not record the floor; it was always 0.1.
-		m.SimilarityFloor = 0.1
+	if m.NumUsers > math.MaxUint32 {
+		return nil, fmt.Errorf("metadata.json: too many users")
 	}
-	size := checkpointSize(dirPath, opts.Followers)
 	slog.Info("Loading checkpoint", "path", dirPath, "influencers", m.NumInfluencers,
-		"edges", m.NumMatrixEdges, "following", m.NumFollowing, "followers", m.NumFollowers, "size_bytes", size)
-	state := &CheckpointState{GraphIndex: NewGraphIndex(), SimilarityFloor: m.SimilarityFloor}
+		"edges", m.NumMatrixEdges, "users", m.NumUsers, "follows", m.NumFollowEdges, "size_bytes", checkpointSize(dirPath))
+	workers := runtime.GOMAXPROCS(0)
+	state := &CheckpointState{SimilarityFloor: m.SimilarityFloor}
 	var g errgroup.Group
 	g.Go(func() error {
-		var err error
-		state.Influencers, err = readCheckpointRecords(filepath.Join(dirPath, "influencers.bin"), m.NumInfluencers, 8, func(b []byte) int64 {
-			return int64(binary.LittleEndian.Uint64(b))
+		err := readCheckpointFile(filepath.Join(dirPath, "influencers.bin"), []checkpointSection{{m.NumInfluencers, 8}}, func(r io.Reader) error {
+			state.Influencers = make([]int64, m.NumInfluencers)
+			return readCheckpointSection(r, m.NumInfluencers, 8, func(i int, b []byte) bool {
+				state.Influencers[i] = int64(binary.LittleEndian.Uint64(b))
+				return true
+			})
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		ids := slices.Clone(state.Influencers)
+		slices.Sort(ids)
+		return readCheckpointFile(filepath.Join(dirPath, "matrix.bin"), []checkpointSection{{m.NumMatrixEdges, 24}}, func(r io.Reader) error {
+			var readErr error
+			edges := func(yield func(SimEdge) bool) {
+				readErr = readCheckpointSection(r, m.NumMatrixEdges, 24, func(_ int, b []byte) bool {
+					return yield(SimEdge{A: int64(binary.LittleEndian.Uint64(b)), B: int64(binary.LittleEndian.Uint64(b[8:])),
+						Weight: math.Float64frombits(binary.LittleEndian.Uint64(b[16:]))})
+				})
+			}
+			sim, err := newSimMatrix(ids, edges)
+			if err != nil {
+				return err
+			}
+			state.sim = sim
+			return readErr
+		})
+	})
+	gi := &GraphIndex{}
+	g.Go(func() error {
+		return readCheckpointFile(filepath.Join(dirPath, "users.bin"), []checkpointSection{{m.NumUsers, 8}}, func(r io.Reader) error {
+			gi.ids = make([]int64, m.NumUsers)
+			if err := readCheckpointSection(r, m.NumUsers, 8, func(i int, b []byte) bool {
+				gi.ids[i] = int64(binary.LittleEndian.Uint64(b))
+				return true
+			}); err != nil {
+				return err
+			}
+			for i := 1; i < len(gi.ids); i++ {
+				if gi.ids[i] <= gi.ids[i-1] {
+					return errors.New("user ids are not strictly ascending")
+				}
+			}
+			return nil
+		})
 	})
 	g.Go(func() error {
-		var err error
-		state.Edges, err = readCheckpointRecords(filepath.Join(dirPath, "matrix.bin"), m.NumMatrixEdges, 24, func(b []byte) SimEdge {
-			return SimEdge{A: int64(binary.LittleEndian.Uint64(b)), B: int64(binary.LittleEndian.Uint64(b[8:])),
-				Weight: math.Float64frombits(binary.LittleEndian.Uint64(b[16:]))}
-		})
-		return err
+		return readCheckpointFile(filepath.Join(dirPath, "following.bin"),
+			[]checkpointSection{{m.NumUsers, 4}, {m.NumFollowEdges, 4}}, func(r io.Reader) error {
+				degrees := make([]uint32, m.NumUsers)
+				if err := readCheckpointUint32s(r, degrees); err != nil {
+					return err
+				}
+				gi.off = make([]uint64, m.NumUsers+1)
+				for u, d := range degrees {
+					gi.off[u+1] = gi.off[u] + uint64(d)
+				}
+				if gi.off[m.NumUsers] != uint64(m.NumFollowEdges) {
+					return fmt.Errorf("out-degrees sum to %d, want %d", gi.off[m.NumUsers], m.NumFollowEdges)
+				}
+				gi.adj = make([]uint32, m.NumFollowEdges)
+				if err := readCheckpointUint32s(r, gi.adj); err != nil {
+					return err
+				}
+				var bad atomic.Int64
+				bad.Store(-1)
+				parallelRange(m.NumUsers, workers, 4096, func(_, lo, hi int) {
+					for u := lo; u < hi; u++ {
+						row := gi.row(uint32(u))
+						for i, v := range row {
+							if int(v) >= m.NumUsers || i > 0 && v <= row[i-1] {
+								bad.Store(int64(u))
+								return
+							}
+						}
+					}
+				})
+				if u := bad.Load(); u >= 0 {
+					return fmt.Errorf("row of user index %d is out of range or not strictly ascending", u)
+				}
+				return nil
+			})
 	})
-	g.Go(func() error {
-		return readCheckpointBitmaps(filepath.Join(dirPath, "following.bin"), &state.GraphIndex.Following, m.NumFollowing)
-	})
-	if opts.Followers {
-		g.Go(func() error {
-			return readCheckpointBitmaps(filepath.Join(dirPath, "followers.bin"), &state.GraphIndex.Followers, m.NumFollowers)
-		})
-	}
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	gi.inDeg = countInDegrees(len(gi.ids), gi.adj, workers)
+	state.GraphIndex = gi
 	slog.Info("Checkpoint loaded", "path", dirPath, "influencers", len(state.Influencers),
-		"edges", len(state.Edges), "following", m.NumFollowing, "followers_loaded", opts.Followers,
-		"size_bytes", size, "duration", time.Since(start))
+		"edges", m.NumMatrixEdges, "users", m.NumUsers, "follows", m.NumFollowEdges, "duration", time.Since(start))
 	return state, nil
 }
 
@@ -250,12 +328,9 @@ func syncCheckpointDir(path string) error {
 	return errors.Join(f.Sync(), f.Close())
 }
 
-func checkpointSize(dir string, followers bool) int64 {
+func checkpointSize(dir string) int64 {
 	var size int64
-	for _, name := range []string{"metadata.json", "influencers.bin", "matrix.bin", "following.bin", "followers.bin"} {
-		if name == "followers.bin" && !followers {
-			continue
-		}
+	for _, name := range checkpointFiles {
 		if info, err := os.Stat(filepath.Join(dir, name)); err == nil {
 			size += info.Size()
 		}
@@ -263,64 +338,116 @@ func checkpointSize(dir string, followers bool) int64 {
 	return size
 }
 
-func writeCheckpointRecords[T any](w io.Writer, records []T, width int, encode func([]byte, T)) error {
+// writeCheckpointSection writes a section of count records.
+func writeCheckpointSection[T any](w io.Writer, count int, records iter.Seq[T], width int, encode func([]byte, T)) error {
 	var header [8]byte
-	binary.LittleEndian.PutUint64(header[:], uint64(len(records)))
+	binary.LittleEndian.PutUint64(header[:], uint64(count))
 	if _, err := w.Write(header[:]); err != nil {
 		return err
 	}
 	buf := make([]byte, (checkpointBufferSize/width)*width)
-	for lo := 0; lo < len(records); {
-		n := min(len(buf)/width, len(records)-lo)
-		for i, record := range records[lo : lo+n] {
-			encode(buf[i*width:(i+1)*width], record)
+	pos, written := 0, 0
+	for record := range records {
+		encode(buf[pos:pos+width], record)
+		pos += width
+		written++
+		if pos == len(buf) {
+			if _, err := w.Write(buf); err != nil {
+				return err
+			}
+			pos = 0
 		}
-		if _, err := w.Write(buf[:n*width]); err != nil {
+	}
+	if written != count {
+		return fmt.Errorf("wrote %d records, expected %d", written, count)
+	}
+	_, err := w.Write(buf[:pos])
+	return err
+}
+
+// checkpointSection describes a section's record count and width.
+type checkpointSection struct{ count, width int }
+
+// readCheckpointFile checks that the file at path holds exactly the given
+// sections, then passes it to read. Errors are prefixed with the path.
+func readCheckpointFile(path string, sections []checkpointSection, read func(io.Reader) error) (err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("%s: %w", path, err)
+		}
+	}()
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	remaining := info.Size()
+	for _, s := range sections {
+		// Division rather than multiplication avoids overflow on a corrupt count.
+		if remaining -= 8; remaining < 0 || int64(s.count) > remaining/int64(s.width) {
+			return fmt.Errorf("file size %d too small for its records", info.Size())
+		}
+		remaining -= int64(s.count) * int64(s.width)
+	}
+	r := bufio.NewReaderSize(f, checkpointBufferSize)
+	if err := read(r); err != nil {
+		return err
+	}
+	return checkpointEOF(r)
+}
+
+// readCheckpointSection reads a section that must hold expected records and
+// passes each to decode, stopping early if decode returns false.
+func readCheckpointSection(r io.Reader, expected, width int, decode func(i int, b []byte) bool) error {
+	var header [8]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return err
+	}
+	if count := binary.LittleEndian.Uint64(header[:]); count != uint64(expected) {
+		return fmt.Errorf("record count %d, expected %d", count, expected)
+	}
+	buf := make([]byte, (checkpointBufferSize/width)*width)
+	for lo := 0; lo < expected; {
+		n := min(len(buf)/width, expected-lo)
+		if _, err := io.ReadFull(r, buf[:n*width]); err != nil {
 			return err
+		}
+		for i := 0; i < n; i++ {
+			if !decode(lo+i, buf[i*width:(i+1)*width]) {
+				return nil
+			}
 		}
 		lo += n
 	}
 	return nil
 }
 
-func readCheckpointRecords[T any](path string, expected, width int, decode func([]byte) T) (records []T, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	defer func() {
-		err = errors.Join(err, f.Close())
-		if err != nil {
-			err = fmt.Errorf("%s: %w", path, err)
-		}
-	}()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
+// readCheckpointUint32s reads a section of uint32 records into dst, which
+// must have the expected length.
+func readCheckpointUint32s(r io.Reader, dst []uint32) error {
 	var header [8]byte
-	if _, err := io.ReadFull(f, header[:]); err != nil {
-		return nil, err
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return err
 	}
-	count := int64(binary.LittleEndian.Uint64(header[:]))
-	// Division rather than multiplication avoids overflow on a corrupt count.
-	if count < 0 || count != int64(expected) || info.Size() < 8 ||
-		(info.Size()-8)%int64(width) != 0 || (info.Size()-8)/int64(width) != count {
-		return nil, fmt.Errorf("invalid count/size: header %d, metadata %d, size %d", count, expected, info.Size())
+	if count := binary.LittleEndian.Uint64(header[:]); count != uint64(len(dst)) {
+		return fmt.Errorf("record count %d, expected %d", count, len(dst))
 	}
-	records = make([]T, expected)
-	buf := make([]byte, (checkpointBufferSize/width)*width)
-	for lo := 0; lo < len(records); {
-		n := min(len(buf)/width, len(records)-lo)
-		if _, err := io.ReadFull(f, buf[:n*width]); err != nil {
-			return nil, err
+	buf := make([]byte, checkpointBufferSize)
+	for len(dst) > 0 {
+		n := min(len(buf)/4, len(dst))
+		if _, err := io.ReadFull(r, buf[:4*n]); err != nil {
+			return err
 		}
-		for i := 0; i < n; i++ {
-			records[lo+i] = decode(buf[i*width : (i+1)*width])
+		for i := range dst[:n] {
+			dst[i] = binary.LittleEndian.Uint32(buf[4*i:])
 		}
-		lo += n
+		dst = dst[n:]
 	}
-	return records, checkpointEOF(f)
+	return nil
 }
 
 func checkpointEOF(r io.Reader) error {
@@ -333,153 +460,4 @@ func checkpointEOF(r io.Reader) error {
 		return err
 	}
 	return fmt.Errorf("trailing data after expected records")
-}
-
-type checkpointBitmap struct {
-	id   int64
-	bm   *roaring64.Bitmap
-	data []byte
-}
-
-func checkpointWorkers() int { return min(runtime.GOMAXPROCS(0), 8) }
-
-// Unbuffered channels bound in-flight bitmap memory to the worker count, not
-// the number of graph users. Only the writer goroutine performs sequential I/O.
-func writeCheckpointBitmaps(w io.Writer, m *smap.Map[int64, *roaring64.Bitmap], expected int) error {
-	g, ctx := errgroup.WithContext(context.Background())
-	jobs := make(chan checkpointBitmap)
-	results := make(chan checkpointBitmap)
-	g.Go(func() error {
-		defer close(jobs)
-		m.Range(func(id int64, bm *roaring64.Bitmap) bool {
-			select {
-			case jobs <- checkpointBitmap{id: id, bm: bm}:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		})
-		return nil
-	})
-	var workers sync.WaitGroup
-	for range checkpointWorkers() {
-		workers.Add(1)
-		g.Go(func() error {
-			defer workers.Done()
-			for job := range jobs {
-				if job.bm == nil || job.bm.GetSerializedSizeInBytes() > checkpointMaxBitmapSize {
-					return fmt.Errorf("user %d: nil or oversized bitmap", job.id)
-				}
-				data, err := job.bm.ToBytes()
-				if err != nil {
-					return fmt.Errorf("user %d: %w", job.id, err)
-				}
-				select {
-				case results <- checkpointBitmap{id: job.id, data: data}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			return nil
-		})
-	}
-	g.Go(func() error { workers.Wait(); close(results); return nil })
-	g.Go(func() error {
-		var header [16]byte
-		count := 0
-		for result := range results {
-			binary.LittleEndian.PutUint64(header[:8], uint64(result.id))
-			binary.LittleEndian.PutUint64(header[8:], uint64(len(result.data)))
-			if _, err := w.Write(header[:]); err != nil {
-				return err
-			}
-			if _, err := w.Write(result.data); err != nil {
-				return err
-			}
-			count++
-		}
-		if count != expected {
-			return fmt.Errorf("record count %d, expected %d", count, expected)
-		}
-		return nil
-	})
-	return g.Wait()
-}
-
-func readCheckpointBitmaps(path string, m *smap.Map[int64, *roaring64.Bitmap], expected int) (err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	defer func() {
-		err = errors.Join(err, f.Close())
-		if err != nil {
-			err = fmt.Errorf("%s: %w", path, err)
-		}
-	}()
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	// Each record has a 16-byte header and at least an 8-byte empty bitmap.
-	if int64(expected) > info.Size()/24 {
-		return fmt.Errorf("file too short for %d records", expected)
-	}
-	g, ctx := errgroup.WithContext(context.Background())
-	jobs := make(chan checkpointBitmap)
-	g.Go(func() error {
-		defer close(jobs)
-		r := bufio.NewReaderSize(f, checkpointBufferSize)
-		remaining := info.Size()
-		var header [16]byte
-		for i := 0; i < expected; i++ {
-			if _, err := io.ReadFull(r, header[:]); err != nil {
-				return err
-			}
-			remaining -= 16
-			id := int64(binary.LittleEndian.Uint64(header[:8]))
-			length := int64(binary.LittleEndian.Uint64(header[8:]))
-			if length < 8 || length > checkpointMaxBitmapSize || length > remaining {
-				return fmt.Errorf("user %d: invalid bitmap length %d (remaining %d)", id, length, remaining)
-			}
-			data := make([]byte, int(length))
-			if _, err := io.ReadFull(r, data); err != nil {
-				return err
-			}
-			remaining -= length
-			select {
-			case jobs <- checkpointBitmap{id: id, data: data}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return checkpointEOF(r)
-	})
-	for range checkpointWorkers() {
-		g.Go(func() error {
-			for job := range jobs {
-				// Roaring64 allocates its outer containers from this count. Bound
-				// it by the bytes available before calling into the decoder.
-				if binary.LittleEndian.Uint64(job.data[:8]) > uint64((len(job.data)-8)/12) {
-					return fmt.Errorf("user %d: invalid bitmap container count", job.id)
-				}
-				bm := roaring64.New()
-				r := bytes.NewReader(job.data)
-				if _, err := bm.ReadFrom(r); err != nil {
-					return fmt.Errorf("user %d: decoding bitmap: %w", job.id, err)
-				}
-				if r.Len() != 0 {
-					return fmt.Errorf("user %d: trailing bitmap data", job.id)
-				}
-				if err := bm.Validate(); err != nil {
-					return fmt.Errorf("user %d: invalid bitmap: %w", job.id, err)
-				}
-				if _, loaded := m.LoadOrStore(job.id, bm); loaded {
-					return fmt.Errorf("duplicate user %d", job.id)
-				}
-			}
-			return nil
-		})
-	}
-	return g.Wait()
 }

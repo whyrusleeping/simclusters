@@ -3,6 +3,7 @@ package simclusters
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,38 +42,35 @@ func ingestReference(t *testing.T, files []string) []Edge {
 	return edges
 }
 
+// ingestCheckGraph compares gi against a reference built from edges: the
+// users, every user's following list and every user's follower count.
 func ingestCheckGraph(t *testing.T, gi *GraphIndex, edges []Edge) {
 	t.Helper()
-	following := make(map[int64]map[uint64]bool)
-	followers := make(map[int64]map[uint64]bool)
-	users := map[int64]bool{0: true, 999999: true}
+	following := make(map[int64]map[int64]bool)
+	followers := make(map[int64]map[int64]bool)
+	users := make(map[int64]bool)
 	for _, e := range edges {
 		users[e.From], users[e.To] = true, true
 		if following[e.From] == nil {
-			following[e.From] = make(map[uint64]bool)
+			following[e.From] = make(map[int64]bool)
 		}
 		if followers[e.To] == nil {
-			followers[e.To] = make(map[uint64]bool)
+			followers[e.To] = make(map[int64]bool)
 		}
-		following[e.From][uint64(e.To)] = true
-		followers[e.To][uint64(e.From)] = true
+		following[e.From][e.To] = true
+		followers[e.To][e.From] = true
 	}
+	if got := gi.NumUsers(); got != len(users) {
+		t.Fatalf("NumUsers = %d, want %d", got, len(users))
+	}
+	users[999999], users[-999999] = true, true // unknown users
 	for user := range users {
-		for _, direction := range []string{"following", "followers"} {
-			wantSet := following[user]
-			got := gi.GetFollowing(user)
-			if direction == "followers" {
-				wantSet = followers[user]
-				got = gi.GetFollowers(user)
-			}
-			want := make([]uint64, 0, len(wantSet))
-			for id := range wantSet {
-				want = append(want, id)
-			}
-			slices.Sort(want)
-			if got.GetCardinality() != uint64(len(want)) || !slices.Equal(got.ToArray(), want) {
-				t.Fatalf("user %d %s = %v, want %v", user, direction, got.ToArray(), want)
-			}
+		want := slices.Sorted(maps.Keys(following[user]))
+		if got := gi.Following(user); !slices.Equal(got, want) {
+			t.Fatalf("user %d following = %v, want %v", user, got, want)
+		}
+		if got := gi.FollowerCount(user); got != len(followers[user]) {
+			t.Fatalf("user %d follower count = %d, want %d", user, got, len(followers[user]))
 		}
 	}
 }
