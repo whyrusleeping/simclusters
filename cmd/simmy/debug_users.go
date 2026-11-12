@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"iter"
 	"strconv"
 
 	"github.com/urfave/cli/v3"
@@ -25,12 +26,12 @@ type userEdgeStats struct {
 }
 
 // collectUserEdgeStats visits the edges only once, counting each requested endpoint.
-func collectUserEdgeStats(users []int64, edges []simclusters.SimEdge) map[int64]userEdgeStats {
+func collectUserEdgeStats(users []int64, edges iter.Seq[simclusters.SimEdge]) map[int64]userEdgeStats {
 	stats := make(map[int64]userEdgeStats, len(users))
 	for _, id := range users {
 		stats[id] = userEdgeStats{}
 	}
-	for _, edge := range edges {
+	for edge := range edges {
 		for i, id := range [2]int64{edge.A, edge.B} {
 			if i == 1 && edge.A == edge.B {
 				continue
@@ -78,11 +79,11 @@ func runDebugUsers(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	fmt.Printf("Loading checkpoint from %s...\n", checkpointPath)
-	state, err := simclusters.LoadCheckpoint(checkpointPath, simclusters.LoadOptions{Followers: true})
+	state, err := simclusters.LoadCheckpoint(checkpointPath)
 	if err != nil {
 		return fmt.Errorf("failed to load checkpoint: %w", err)
 	}
-	fmt.Printf("Loaded checkpoint with %d influencers, %d edges\n", len(state.Influencers), len(state.Edges))
+	fmt.Printf("Loaded checkpoint with %d influencers, %d edges\n", len(state.Influencers), state.NumSimilarityEdges())
 
 	influencerCommunities, err := loadAssignments(cmd.String("influencers"))
 	if err != nil {
@@ -92,7 +93,7 @@ func runDebugUsers(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	stats := collectUserEdgeStats(missingUsers, state.Edges)
+	stats := collectUserEdgeStats(missingUsers, state.SimilarityEdges())
 	influencerSet := make(map[int64]bool)
 	for _, id := range state.Influencers {
 		influencerSet[id] = true

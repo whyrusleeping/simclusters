@@ -17,7 +17,7 @@ import (
 type IngestOptions struct {
 	Workers    int               // Parallel parsers; default runtime.NumCPU().
 	ChunkBytes int64             // Approximate newline-aligned range size; default 64 MiB.
-	BatchEdges int               // Edges buffered per worker; default 1<<20.
+	BatchEdges int               // Edges buffered per worker; default 1<<16.
 	Progress   func(bytes int64) // Optional concurrent callback reporting byte deltas.
 }
 
@@ -42,7 +42,7 @@ func LoadEdgesCSV(gi *GraphIndex, paths []string, opts IngestOptions) (int64, er
 		opts.ChunkBytes = 64 << 20
 	}
 	if opts.BatchEdges == 0 {
-		opts.BatchEdges = 1 << 20
+		opts.BatchEdges = 1 << 16
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

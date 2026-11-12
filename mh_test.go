@@ -1,6 +1,7 @@
 package simclusters
 
 import (
+	"cmp"
 	"maps"
 	"math"
 	"math/rand"
@@ -46,6 +47,29 @@ func plantedEdges(seed int64, groups, groupSize int, pIn float64, noisePerNode, 
 		}
 	}
 	return edges, groupOf
+}
+
+// simMatrixOf builds a matrix over the endpoints of edges, in either
+// orientation; self loops are dropped.
+func simMatrixOf(edges []SimEdge) *simMatrix {
+	var ids []int64
+	var upper []SimEdge
+	for _, e := range edges {
+		ids = append(ids, e.A, e.B)
+		if e.A > e.B {
+			e.A, e.B = e.B, e.A
+		}
+		if e.A != e.B {
+			upper = append(upper, e)
+		}
+	}
+	slices.Sort(ids)
+	slices.SortFunc(upper, func(a, b SimEdge) int { return cmp.Or(cmp.Compare(a.A, b.A), cmp.Compare(a.B, b.B)) })
+	m, err := newSimMatrix(slices.Compact(ids), slices.Values(upper))
+	if err != nil {
+		panic(err)
+	}
+	return m
 }
 
 func testParams(k int) mhParams {
@@ -110,14 +134,14 @@ func TestInitializeRespectsCap(t *testing.T) {
 	// Hubs are among the strongest neighbours of many seeds, which used to
 	// put them in hundreds of communities.
 	edges, _ := plantedEdges(1, 40, 25, 0.6, 3, 20, 300)
-	g := newSimGraph(edges, 0, 0, 4)
+	g := newSimGraph(simMatrixOf(edges), 0, 0, 4)
 	s := newMHState(g, testParams(g.numNodes()/4))
 	checkInvariants(t, s)
 }
 
 func TestProposalDeltaMatchesObjective(t *testing.T) {
 	edges, _ := plantedEdges(2, 20, 20, 0.6, 3, 5, 100)
-	g := newSimGraph(edges, 0, 0, 1)
+	g := newSimGraph(simMatrixOf(edges), 0, 0, 1)
 	p := testParams(g.numNodes() / 4)
 	p.workers = 1
 	p.batchSize = 1 // every proposal sees the exact current state
@@ -146,7 +170,7 @@ func TestProposalDeltaMatchesObjective(t *testing.T) {
 
 func TestDetectCommunitiesIsDeterministic(t *testing.T) {
 	edges, _ := plantedEdges(3, 30, 20, 0.6, 3, 5, 100)
-	g := newSimGraph(edges, 0, 0, 4)
+	g := newSimGraph(simMatrixOf(edges), 0, 0, 4)
 	run := func(seed uint64, workers int) []int32 {
 		p := testParams(g.numNodes() / 4)
 		p.seed, p.workers = seed, workers
@@ -166,7 +190,7 @@ func TestDetectCommunitiesIsDeterministic(t *testing.T) {
 func TestDetectCommunitiesRecoversPlantedGroups(t *testing.T) {
 	const groups, groupSize = 40, 25
 	edges, groupOf := plantedEdges(4, groups, groupSize, 0.6, 3, 0, 0)
-	g := newSimGraph(edges, 0, 0, 4)
+	g := newSimGraph(simMatrixOf(edges), 0, 0, 4)
 	initial := newMHState(g, testParams(2*groups)).objective().Score
 	s := detectCommunities(g, testParams(2*groups), 60, 2)
 	checkInvariants(t, s)
@@ -212,7 +236,7 @@ func TestDetectCommunitiesRecoversPlantedGroups(t *testing.T) {
 // BenchmarkMHStep measures one node update on a 6000-node graph with hubs.
 func BenchmarkMHStep(b *testing.B) {
 	edges, _ := plantedEdges(1, 200, 30, 0.6, 3, 60, 800)
-	g := newSimGraph(edges, 0, 0, 1)
+	g := newSimGraph(simMatrixOf(edges), 0, 0, 1)
 	p := testParams(g.numNodes() / 4)
 	p.workers = 1
 	s := newMHState(g, p)
@@ -226,7 +250,7 @@ func BenchmarkMHStep(b *testing.B) {
 
 func TestAssignmentsScores(t *testing.T) {
 	edges, _ := plantedEdges(5, 10, 20, 0.7, 2, 0, 0)
-	g := newSimGraph(edges, 0, 0, 2)
+	g := newSimGraph(simMatrixOf(edges), 0, 0, 2)
 	s := detectCommunities(g, testParams(10), 20, 2)
 	out := s.assignments()
 	if len(out) != g.numNodes() {
@@ -271,14 +295,14 @@ func TestNewSimGraphMaxNeighbors(t *testing.T) {
 		return d
 	}
 
-	full := newSimGraph(edges, 0.15, 0, 2)
+	full := newSimGraph(simMatrixOf(edges), 0.15, 0, 2)
 	if got, want := degrees(full), map[int64]int{1: 4, 2: 3, 3: 3, 4: 3, 5: 1}; !maps.Equal(got, want) || full.numEdges != 7 {
 		t.Errorf("degrees with min weight 0.15: %v (%d edges), want %v (7 edges)", got, full.numEdges, want)
 	}
 
 	// With two neighbours each: node 1 keeps 2 and 3; nodes 2, 3 and 4 keep
 	// the triangle; node 5 keeps its only edge, which is to node 1.
-	sparse := newSimGraph(edges, 0.15, 2, 2)
+	sparse := newSimGraph(simMatrixOf(edges), 0.15, 2, 2)
 	if got, want := degrees(sparse), map[int64]int{1: 3, 2: 3, 3: 3, 4: 2, 5: 1}; !maps.Equal(got, want) || sparse.numEdges != 6 {
 		t.Errorf("degrees with 2 neighbours: %v (%d edges), want %v (6 edges)", got, sparse.numEdges, want)
 	}

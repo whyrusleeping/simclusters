@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"slices"
 	"testing"
 
 	"github.com/whyrusleeping/simclusters"
@@ -41,7 +42,7 @@ func TestCollectUserEdgeStats(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got := collectUserEdgeStats(tt.users, tt.edges)
+			got := collectUserEdgeStats(tt.users, slices.Values(tt.edges))
 			if len(got) != len(tt.want) {
 				t.Fatalf("got %d users, want %d", len(got), len(tt.want))
 			}

@@ -6,8 +6,6 @@ import (
 	"slices"
 	"sync"
 	"testing"
-
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
 func TestAddEdgesBatchConcurrentFirstInsert(t *testing.T) {
@@ -27,10 +25,10 @@ func TestAddEdgesBatchConcurrentFirstInsert(t *testing.T) {
 		}
 		close(start)
 		wg.Wait()
-		if got := gi.GetFollowers(1).GetCardinality(); got != goroutines {
+		if got := gi.FollowerCount(1); got != goroutines {
 			t.Fatalf("trial %d: user 1 has %d followers, want %d", trial, got, goroutines)
 		}
-		if got := gi.GetFollowing(7).GetCardinality(); got != goroutines {
+		if got := len(gi.Following(7)); got != goroutines {
 			t.Fatalf("trial %d: user 7 follows %d users, want %d", trial, got, goroutines)
 		}
 	}
@@ -46,12 +44,6 @@ func TestFollowerCountIgnoresDuplicateEdges(t *testing.T) {
 	if got := gi.FollowerCount(99); got != 0 {
 		t.Errorf("FollowerCount of an unknown user = %d, want 0", got)
 	}
-}
-
-func bitmapOf(vals ...uint64) *roaring64.Bitmap {
-	bm := roaring64.New()
-	bm.AddMany(vals)
-	return bm
 }
 
 // followEdges gives influencer `to` the followers base..base+n-1.
@@ -79,7 +71,7 @@ func TestSimilarityKeepsPairsMinHashUsedToDrop(t *testing.T) {
 		gi.AddEdgesBatch(edges)
 
 		want := float64(tc.inter) / math.Sqrt(float64(tc.a)*float64(tc.b))
-		got := buildSimilarityEdges(gi, []int64{2, 1}, 0.1, 2, nil)
+		got := slices.Collect(buildSimilarity(gi, []int64{2, 1}, 0.1, 2, nil).edges())
 		if len(got) != 1 || got[0].A != 1 || got[0].B != 2 || math.Abs(got[0].Weight-want) > 1e-12 {
 			t.Errorf("sizes %d/%d: got %+v, want one edge 1-2 with weight %.4f", tc.a, tc.b, got, want)
 		}
@@ -116,11 +108,24 @@ func TestSimilarityEdgesMatchBruteForce(t *testing.T) {
 	}
 	gi.AddEdgesBatch(edges)
 
+	followers := make(map[int64]map[int64]bool)
+	for _, e := range edges {
+		if followers[e.To] == nil {
+			followers[e.To] = make(map[int64]bool)
+		}
+		followers[e.To][e.From] = true
+	}
 	var want []SimEdge
 	for i, a := range ids {
 		for _, b := range ids[i+1:] {
-			fa, fb := gi.GetFollowers(a), gi.GetFollowers(b)
-			sim := cosineSimilarity(float64(fa.AndCardinality(fb)), float64(fa.GetCardinality()), float64(fb.GetCardinality()))
+			fa, fb := followers[a], followers[b]
+			inter := 0
+			for u := range fa {
+				if fb[u] {
+					inter++
+				}
+			}
+			sim := cosineSimilarity(float64(inter), float64(len(fa)), float64(len(fb)))
 			if sim >= threshold {
 				want = append(want, SimEdge{A: a, B: b, Weight: sim})
 			}
@@ -131,7 +136,7 @@ func TestSimilarityEdgesMatchBruteForce(t *testing.T) {
 	}
 
 	for _, workers := range []int{1, 5} {
-		got := buildSimilarityEdges(gi, ids, threshold, workers, nil)
+		got := slices.Collect(buildSimilarity(gi, ids, threshold, workers, nil).edges())
 		if !slices.Equal(got, want) {
 			t.Errorf("workers=%d: got %d edges, brute force found %d (or they differ)", workers, len(got), len(want))
 		}

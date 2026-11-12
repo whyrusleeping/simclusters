@@ -470,7 +470,7 @@ func (s *mhState) runEpoch(epoch int, temperature float64) epochStats {
 	for start := 0; start < n; start += s.p.batchSize {
 		nodes := s.order[start:min(start+s.p.batchSize, n)]
 		props := s.props[:len(nodes)]
-		parallelRange(len(nodes), s.p.workers, 16, func(worker, lo, hi int) {
+		parallelRange(len(nodes), s.p.workers, 1, func(worker, lo, hi int) {
 			sc := s.scratch[worker]
 			var rng stepRNG
 			for i := lo; i < hi; i++ {

@@ -9,15 +9,28 @@ import (
 )
 
 func TestInterestedIn(t *testing.T) {
-	knownFor := map[int64][]communityScore{
-		1: {{Community: 10, Score: 0.6}, {Community: 11, Score: 0.2}},
-		2: {{Community: 10, Score: 0.2}},
-		3: {{Community: 12, Score: 0.5}, {Community: 13, Score: 0.5}},
+	knownFor := map[int64]map[int]float64{
+		1: {10: 0.6, 11: 0.2},
+		2: {10: 0.2},
+		3: {12: 0.5, 13: 0.5},
 	}
-	acc := make(map[int]float64)
+	gi := NewGraphIndex()
+	gi.AddEdgesBatch([]Edge{
+		{From: 1001, To: 1}, {From: 1001, To: 2}, {From: 1001, To: 99}, // 99 is not an influencer
+		{From: 1002, To: 1}, {From: 1002, To: 2}, {From: 1002, To: 3},
+		{From: 1003, To: 98}, {From: 1003, To: 99},
+	})
+	x := newInterestIndex(gi, knownFor, 2)
+	acc := make([]float64, x.numCommunities)
+	user := func(id int64) uint32 {
+		u, ok := gi.index(id)
+		if !ok {
+			t.Fatalf("user %d missing", id)
+		}
+		return u
+	}
 
-	// Follows influencers 1 and 2, and user 99 who is not an influencer.
-	got := interestedIn(bitmapOf(1, 2, 99), knownFor, 5, acc, nil)
+	got := x.interestedIn(user(1001), 5, acc, nil)
 	want := []communityScore{{10, 0.8}, {11, 0.2}}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -27,12 +40,14 @@ func TestInterestedIn(t *testing.T) {
 			t.Fatalf("got %v, want %v", got, want)
 		}
 	}
-	if len(acc) != 0 {
-		t.Errorf("scratch map was not cleared: %v", acc)
+	for c, v := range acc {
+		if v != 0 {
+			t.Fatalf("scratch was not cleared: acc[%d] = %v", c, v)
+		}
 	}
 
 	// Scores are normalized before truncation, and ties break by community.
-	got = interestedIn(bitmapOf(1, 2, 3), knownFor, 3, acc, got)
+	got = x.interestedIn(user(1002), 3, acc, got)
 	want = []communityScore{{10, 0.4}, {12, 0.25}, {13, 0.25}}
 	for i := range want {
 		if len(got) != len(want) || got[i].Community != want[i].Community || math.Abs(got[i].Score-want[i].Score) > 1e-12 {
@@ -40,7 +55,7 @@ func TestInterestedIn(t *testing.T) {
 		}
 	}
 
-	if got := interestedIn(bitmapOf(98, 99), knownFor, 5, acc, nil); len(got) != 0 {
+	if got := x.interestedIn(user(1003), 5, acc, nil); len(got) != 0 {
 		t.Errorf("user following no influencer got interests %v", got)
 	}
 }
